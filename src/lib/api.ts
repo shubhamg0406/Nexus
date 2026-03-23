@@ -17,12 +17,23 @@ export interface PriceFetchResult {
   error?: string;
 }
 
+interface CachedPriceResult {
+  price: number;
+  previousClose?: number | null;
+  currency?: string;
+  sourceUrl?: string;
+  normalizedTicker?: string;
+  savedAt: number;
+}
+
 export const DEFAULT_PRICE_PROVIDER_SETTINGS: PriceProviderSettings = {
   alphaVantageApiKey: '',
   finnhubApiKey: '',
   primaryProvider: 'yahoo',
   secondaryProvider: 'alphavantage',
 };
+
+const YAHOO_COOLDOWN_MS = 5 * 60 * 1000;
 
 export async function fetchExchangeRates(base: string = 'USD') {
   try {
@@ -73,7 +84,10 @@ export async function fetchPriceWithProviderOrder(
   providers: PriceProvider[],
   settings: PriceProviderSettings = DEFAULT_PRICE_PROVIDER_SETTINGS,
 ) {
-  const uniqueProviders = dedupeProviders(providers);
+  const configuredProviders = providers.filter((provider) => isProviderConfigured(provider, settings));
+  const uniqueProviders = prioritizeAvailableProviders(
+    dedupeProviders(configuredProviders.length > 0 ? configuredProviders : ['yahoo']),
+  );
   let lastFailure: PriceFetchResult | null = null;
 
   for (let index = 0; index < uniqueProviders.length; index += 1) {
@@ -93,6 +107,13 @@ export async function fetchPriceWithProviderOrder(
     provider: settings.primaryProvider,
     error: 'Price lookup failed.',
   };
+}
+
+function isProviderConfigured(provider: PriceProvider, settings: PriceProviderSettings) {
+  if (provider === 'yahoo') return true;
+  if (provider === 'alphavantage') return Boolean(settings.alphaVantageApiKey?.trim());
+  if (provider === 'finnhub') return Boolean(settings.finnhubApiKey?.trim());
+  return false;
 }
 
 export async function fetchStockPrice(
@@ -233,14 +254,45 @@ export async function getGoldPrice(currency: 'INR' | 'CAD' | 'USD') {
 }
 
 async function fetchYahooPrice(originalTicker: string, normalizedTicker: string): Promise<PriceFetchResult> {
-  const response = await fetch(`/api/finance?ticker=${encodeURIComponent(originalTicker)}`);
-  if (!response.ok) {
-    const data = await safeJson(response);
+  const cachedYahooResult = readCachedPrice(originalTicker, 'yahoo');
+  if (isYahooCooldownActive()) {
+    if (cachedYahooResult) {
+      return {
+        ...cachedYahooResult,
+        provider: 'yahoo',
+        error: 'Yahoo is temporarily rate-limiting requests. Using the last known Yahoo price for now.',
+      };
+    }
+
     return {
       price: null,
       provider: 'yahoo',
       normalizedTicker,
-      error: data?.error || `Yahoo returned ${response.status}`,
+      error: 'Yahoo is temporarily rate-limiting requests. Please retry later or use another provider.',
+    };
+  }
+
+  const response = await fetch(`/api/finance?ticker=${encodeURIComponent(originalTicker)}`);
+  if (!response.ok) {
+    const data = await safeJson(response);
+    const error = data?.error || `Yahoo returned ${response.status}`;
+
+    if (response.status === 429 || isYahooRateLimitMessage(error)) {
+      setYahooCooldown();
+      if (cachedYahooResult) {
+        return {
+          ...cachedYahooResult,
+          provider: 'yahoo',
+          error: 'Yahoo is temporarily rate-limiting requests. Using the last known Yahoo price for now.',
+        };
+      }
+    }
+
+    return {
+      price: null,
+      provider: 'yahoo',
+      normalizedTicker,
+      error,
     };
   }
   const data = await safeJson(response);
@@ -252,7 +304,7 @@ async function fetchYahooPrice(originalTicker: string, normalizedTicker: string)
       error: 'Yahoo Finance proxy is unavailable from this app instance. Use the app server route or choose another provider.',
     };
   }
-  return {
+  const result: PriceFetchResult = {
     price: typeof data?.price === 'number' ? data.price : null,
     previousClose: typeof data?.previousClose === 'number' ? data.previousClose : null,
     provider: 'yahoo',
@@ -261,6 +313,13 @@ async function fetchYahooPrice(originalTicker: string, normalizedTicker: string)
     sourceUrl: typeof data?.sourceUrl === 'string' ? data.sourceUrl : buildProviderQuoteUrl('yahoo', normalizedTicker),
     error: typeof data?.price === 'number' ? undefined : 'Yahoo did not return a usable price.',
   };
+
+  if (result.price != null) {
+    clearYahooCooldown();
+    writeCachedPrice(originalTicker, result);
+  }
+
+  return result;
 }
 
 async function fetchAlphaVantagePrice(ticker: string, apiKey: string): Promise<PriceFetchResult> {
@@ -359,8 +418,104 @@ function dedupeProviders(providers: PriceProvider[]) {
   return Array.from(new Set(providers));
 }
 
+function prioritizeAvailableProviders(providers: PriceProvider[]) {
+  if (!isYahooCooldownActive()) return providers;
+  return [...providers].sort((left, right) => {
+    if (left === right) return 0;
+    if (left === 'yahoo') return 1;
+    if (right === 'yahoo') return -1;
+    return 0;
+  });
+}
+
 function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getStorage() {
+  try {
+    return globalThis.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+function getYahooCooldownKey() {
+  return 'nexus-portfolio:yahoo-cooldown-until';
+}
+
+function getPriceCacheKey(ticker: string, provider: PriceProvider) {
+  return `nexus-portfolio:price-cache:${provider}:${ticker.trim().toUpperCase()}`;
+}
+
+function isYahooCooldownActive() {
+  const storage = getStorage();
+  if (!storage) return false;
+  const rawValue = storage.getItem(getYahooCooldownKey());
+  const cooldownUntil = rawValue ? Number(rawValue) : 0;
+  if (!Number.isFinite(cooldownUntil) || cooldownUntil <= Date.now()) {
+    storage.removeItem(getYahooCooldownKey());
+    return false;
+  }
+  return true;
+}
+
+function setYahooCooldown() {
+  const storage = getStorage();
+  if (!storage) return;
+  storage.setItem(getYahooCooldownKey(), String(Date.now() + YAHOO_COOLDOWN_MS));
+}
+
+function clearYahooCooldown() {
+  const storage = getStorage();
+  if (!storage) return;
+  storage.removeItem(getYahooCooldownKey());
+}
+
+function readCachedPrice(ticker: string, provider: PriceProvider): CachedPriceResult | null {
+  const storage = getStorage();
+  if (!storage) return null;
+
+  const rawValue = storage.getItem(getPriceCacheKey(ticker, provider));
+  if (!rawValue) return null;
+
+  try {
+    const parsed = JSON.parse(rawValue) as Partial<CachedPriceResult>;
+    if (typeof parsed.price !== 'number') return null;
+    return {
+      price: parsed.price,
+      previousClose: typeof parsed.previousClose === 'number' ? parsed.previousClose : null,
+      currency: typeof parsed.currency === 'string' ? parsed.currency : undefined,
+      sourceUrl: typeof parsed.sourceUrl === 'string' ? parsed.sourceUrl : undefined,
+      normalizedTicker: typeof parsed.normalizedTicker === 'string' ? parsed.normalizedTicker : undefined,
+      savedAt: typeof parsed.savedAt === 'number' ? parsed.savedAt : Date.now(),
+    };
+  } catch {
+    storage.removeItem(getPriceCacheKey(ticker, provider));
+    return null;
+  }
+}
+
+function writeCachedPrice(ticker: string, result: PriceFetchResult) {
+  const storage = getStorage();
+  if (!storage || result.price == null) return;
+
+  const payload: CachedPriceResult = {
+    price: result.price,
+    previousClose: typeof result.previousClose === 'number' ? result.previousClose : null,
+    currency: result.currency,
+    sourceUrl: result.sourceUrl,
+    normalizedTicker: result.normalizedTicker,
+    savedAt: Date.now(),
+  };
+
+  storage.setItem(getPriceCacheKey(ticker, result.provider), JSON.stringify(payload));
+}
+
+function isYahooRateLimitMessage(message?: string) {
+  if (!message) return false;
+  const normalizedMessage = message.toLowerCase();
+  return normalizedMessage.includes('429') || normalizedMessage.includes('rate limit');
 }
 
 function buildProviderQuoteUrl(provider: PriceProvider, ticker: string) {

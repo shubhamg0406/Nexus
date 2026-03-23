@@ -35,6 +35,7 @@ interface PortfolioContextType {
   priceProviderSettings: PriceProviderSettings;
   updatePriceProviderSettings: (settings: PriceProviderSettings) => Promise<void>;
   addAsset: (asset: Omit<Asset, 'id'>) => Promise<void>;
+  duplicateAsset: (id: string) => Promise<void>;
   updateAsset: (asset: Asset) => Promise<void>;
   removeAsset: (id: string) => Promise<void>;
   refreshAsset: (id: string) => Promise<void>;
@@ -42,6 +43,12 @@ interface PortfolioContextType {
   refreshFailedPrices: () => Promise<void>;
   importAssets: (assets: Asset[]) => Promise<void>;
   importAssetClasses: (classes: AssetClassDef[]) => Promise<void>;
+  replaceCloudPortfolio: (data: {
+    assets: Asset[];
+    assetClasses: AssetClassDef[];
+    baseCurrency?: 'CAD' | 'INR' | 'USD' | 'ORIGINAL';
+    priceProviderSettings?: PriceProviderSettings;
+  }) => Promise<void>;
   addAssetClass: (cls: Omit<AssetClassDef, 'id'>) => Promise<void>;
   updateAssetClass: (cls: AssetClassDef) => Promise<void>;
   removeAssetClass: (id: string) => Promise<void>;
@@ -224,6 +231,25 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
     }));
   };
 
+  const duplicateAsset = async (id: string) => {
+    await mutatePortfolio((current) => {
+      const sourceAsset = current.assets.find((asset) => asset.id === id);
+      if (!sourceAsset) return current;
+
+      const duplicatedAsset: Asset = {
+        ...sourceAsset,
+        id: crypto.randomUUID(),
+        name: `${sourceAsset.name} Copy`,
+        lastUpdated: Date.now(),
+      };
+
+      return {
+        ...current,
+        assets: [...current.assets, duplicatedAsset],
+      };
+    });
+  };
+
   const updateAsset = async (asset: Asset) => {
     await mutatePortfolio((current) => ({
       ...current,
@@ -279,6 +305,21 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
     } finally {
       setImportProgress(EMPTY_PROGRESS);
     }
+  };
+
+  const replaceCloudPortfolio = async (data: {
+    assets: Asset[];
+    assetClasses: AssetClassDef[];
+    baseCurrency?: 'CAD' | 'INR' | 'USD' | 'ORIGINAL';
+    priceProviderSettings?: PriceProviderSettings;
+  }) => {
+    await mutatePortfolio((current) => ({
+      ...current,
+      assets: data.assets,
+      assetClasses: data.assetClasses,
+      baseCurrency: data.baseCurrency ?? current.baseCurrency,
+      priceProviderSettings: data.priceProviderSettings ?? current.priceProviderSettings,
+    }));
   };
 
   const addAssetClass = async (cls: Omit<AssetClassDef, 'id'>) => {
@@ -385,6 +426,7 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
       priceProviderSettings: portfolio.priceProviderSettings,
       updatePriceProviderSettings,
       addAsset,
+      duplicateAsset,
       updateAsset,
       removeAsset,
       refreshAsset,
@@ -392,6 +434,7 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
       refreshFailedPrices,
       importAssets,
       importAssetClasses,
+      replaceCloudPortfolio,
       addAssetClass,
       updateAssetClass,
       removeAssetClass,
@@ -454,7 +497,7 @@ async function refreshAssetPrices(
   onlyFailedRows: boolean,
   forceTickerRefresh: boolean = false,
 ) {
-  return Promise.all(sourceAssets.map(async (asset) => {
+  return mapWithConcurrency(sourceAssets, 3, async (asset) => {
     if (!asset.autoUpdate && !(forceTickerRefresh && asset.ticker)) return asset;
     if (onlyFailedRows && asset.priceFetchStatus !== 'failed') return asset;
 
@@ -502,7 +545,7 @@ async function refreshAssetPrices(
             : result.previousClose * effectiveFactor
           : asset.previousClose;
         priceFetchStatus = 'success';
-        priceFetchMessage = formulaResult?.error || undefined;
+        priceFetchMessage = formulaResult?.error || result.error || undefined;
         priceProvider = result.provider;
       } else {
         priceFetchStatus = 'failed';
@@ -533,7 +576,7 @@ async function refreshAssetPrices(
       priceFetchMessage,
       priceProvider,
     };
-  }));
+  });
 }
 
 function normalizeCurrency(currency?: string | null): Asset['currency'] | null {
@@ -554,6 +597,27 @@ function getFxConversionFactor(
   if (!fromRate || !toRate) return 1;
 
   return toRate / fromRate;
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>,
+) {
+  const results = new Array<R>(items.length);
+  let currentIndex = 0;
+
+  async function worker() {
+    while (currentIndex < items.length) {
+      const itemIndex = currentIndex;
+      currentIndex += 1;
+      results[itemIndex] = await mapper(items[itemIndex], itemIndex);
+    }
+  }
+
+  const workerCount = Math.min(concurrency, Math.max(items.length, 1));
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
 }
 
 function getFirestoreErrorMessage(error: unknown) {

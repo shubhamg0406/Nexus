@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { usePortfolio } from '../store/PortfolioContext';
 import { Asset } from '../store/db';
 import {
@@ -14,13 +14,16 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '.
 import { Input } from './ui/input';
 import { Button } from './ui/button';
 import { TickerRepairModal } from './TickerRepairModal';
-import { AlertTriangle, ArrowDown, ArrowUp, ArrowUpDown, Building2, Check, ChevronDown, Edit, Filter, Gem, Landmark, LineChart, PiggyBank, RefreshCw, ShieldCheck, Trash2, WalletCards } from 'lucide-react';
+import { Dialog, DialogDescription, DialogHeader, DialogTitle } from './ui/dialog';
+import { AlertTriangle, ArrowDown, ArrowUp, ArrowUpDown, Building2, Check, ChevronDown, Edit, Ellipsis, Filter, Gem, Landmark, LineChart, PiggyBank, RefreshCw, ShieldCheck, Trash2, WalletCards } from 'lucide-react';
 import { convertAmount, formatCurrency, formatPercent, getAssetXirr, getCurrentPrice, getCurrentTotal, getGrowthTotal, getInvestmentPrice, getInvestmentTotal, isDebtAssetClass } from '../lib/portfolioMetrics';
 import { getTickerRecommendation } from '../lib/api';
 
 type LedgerCurrency = 'CAD' | 'INR' | 'USD' | 'ORIGINAL';
 type FilterColumnId = 'name' | 'assetClass' | 'position' | 'currentPrice' | 'marketValue' | 'performance' | 'notes';
 type FilterState = Record<FilterColumnId, { selected: string[]; search: string; min: string; max: string }>;
+
+const TABLE_COLUMN_WIDTHS = ['30%', '10%', '10%', '12%', '12%', '10%', '10%', '6%'] as const;
 
 const EMPTY_FILTER_STATE: FilterState = {
   name: { selected: [], search: '', min: '', max: '' },
@@ -33,7 +36,7 @@ const EMPTY_FILTER_STATE: FilterState = {
 };
 
 export function Ledger({ onEditAsset }: { onEditAsset?: (asset: Asset) => void }) {
-  const { assets, baseCurrency, rates, removeAsset, refreshAsset, refreshPrices, refreshFailedPrices, isRefreshing } = usePortfolio();
+  const { assets, baseCurrency, rates, priceProviderSettings, removeAsset, duplicateAsset, refreshAsset, refreshPrices, refreshFailedPrices, isRefreshing } = usePortfolio();
   const [canadaSorting, setCanadaSorting] = useState<SortingState>([
     { id: 'name', desc: false },
   ]);
@@ -48,6 +51,9 @@ export function Ledger({ onEditAsset }: { onEditAsset?: (asset: Asset) => void }
   const [refreshingRowIds, setRefreshingRowIds] = useState<string[]>([]);
   const [columnFilters, setColumnFilters] = useState<FilterState>(EMPTY_FILTER_STATE);
   const [openColumnFilter, setOpenColumnFilter] = useState<FilterColumnId | null>(null);
+  const [statsModal, setStatsModal] = useState<{ type: 'rows' | 'failed' | 'manual'; open: boolean }>({ type: 'rows', open: false });
+  const [openRowMenuId, setOpenRowMenuId] = useState<string | null>(null);
+  const rowMenuRef = useRef<HTMLDivElement | null>(null);
 
   const handleRefreshRow = React.useCallback(async (assetId: string) => {
     setRefreshingRowIds((current) => current.includes(assetId) ? current : [...current, assetId]);
@@ -119,6 +125,18 @@ export function Ledger({ onEditAsset }: { onEditAsset?: (asset: Asset) => void }
     }
     return () => document.removeEventListener('click', handleClickOutside);
   }, [openColumnFilter]);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (rowMenuRef.current && !rowMenuRef.current.contains(event.target as Node)) {
+        setOpenRowMenuId(null);
+      }
+    };
+    if (openRowMenuId) {
+      document.addEventListener('mousedown', handleClickOutside);
+    }
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [openRowMenuId]);
 
   const getNumericFilterValue = React.useCallback((asset: Asset, columnId: FilterColumnId) => {
     switch (columnId) {
@@ -307,7 +325,7 @@ export function Ledger({ onEditAsset }: { onEditAsset?: (asset: Asset) => void }
             <div className="space-y-1" style={{ fontVariantNumeric: 'tabular-nums' }}>
               <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">{asset.quantity.toLocaleString(undefined, { maximumFractionDigits: 4 })}</div>
               <div className={`text-xs ${isDebtAssetClass(asset.assetClass) ? 'text-red-500' : 'text-slate-500 dark:text-slate-400'}`}>
-                Avg: {formatCurrency(investmentPrice, displayCurrency)}
+                {isDebtAssetClass(asset.assetClass) ? `Balance per unit: ${formatCurrency(investmentPrice, displayCurrency)}` : `Avg: ${formatCurrency(investmentPrice, displayCurrency)}`}
               </div>
             </div>
           );
@@ -379,7 +397,7 @@ export function Ledger({ onEditAsset }: { onEditAsset?: (asset: Asset) => void }
                 {formatCurrency(currentTotal, displayCurrency)}
               </div>
               <div className={`text-xs ${isDebtAssetClass(asset.assetClass) ? 'text-red-500' : 'text-slate-500 dark:text-slate-400'}`}>
-                Cost basis: {formatCurrency(investmentTotal, displayCurrency)}
+                {isDebtAssetClass(asset.assetClass) ? `Debt balance: ${formatCurrency(investmentTotal, displayCurrency)}` : `Cost basis: ${formatCurrency(investmentTotal, displayCurrency)}`}
               </div>
             </div>
           );
@@ -407,7 +425,9 @@ export function Ledger({ onEditAsset }: { onEditAsset?: (asset: Asset) => void }
                   {formatCurrency(growthTotal, displayCurrency)}
                 </span>
               </div>
-              <div className="text-xs font-medium text-slate-600 dark:text-slate-300">XIRR: {formatPercent(xirr)}</div>
+              <div className="text-xs font-medium text-slate-600 dark:text-slate-300">
+                {isDebtAssetClass(asset.assetClass) ? 'XIRR: Not applicable for debt' : `XIRR: ${formatPercent(xirr)}`}
+              </div>
             </div>
           );
         },
@@ -429,19 +449,63 @@ export function Ledger({ onEditAsset }: { onEditAsset?: (asset: Asset) => void }
         id: 'actions',
         enableColumnFilter: false,
         enableSorting: false,
-        cell: (info) => (
-          <div className="flex items-center gap-1">
-            <Button variant="ghost" size="icon" onClick={() => onEditAsset?.(info.row.original)}>
-              <Edit className="h-4 w-4 text-slate-500" />
-            </Button>
-            <Button variant="ghost" size="icon" onClick={() => removeAsset(info.row.original.id)}>
-              <Trash2 className="h-4 w-4 text-red-500" />
-            </Button>
-          </div>
-        ),
+        cell: (info) => {
+          const asset = info.row.original;
+          const menuOpen = openRowMenuId === asset.id;
+
+          return (
+            <div className="relative flex items-center justify-end" ref={menuOpen ? rowMenuRef : null}>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => setOpenRowMenuId((current) => current === asset.id ? null : asset.id)}
+                title="More actions"
+              >
+                <Ellipsis className="h-4 w-4 text-slate-500" />
+              </Button>
+              {menuOpen ? (
+                <div className="absolute right-0 top-10 z-30 min-w-[180px] rounded-xl border border-slate-200 bg-white p-1.5 shadow-xl dark:border-slate-800 dark:bg-slate-950">
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      setOpenRowMenuId(null);
+                      await duplicateAsset(asset.id);
+                    }}
+                    className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-900"
+                  >
+                    <WalletCards className="h-4 w-4" />
+                    Duplicate Asset
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpenRowMenuId(null);
+                      onEditAsset?.(asset);
+                    }}
+                    className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-900"
+                  >
+                    <Edit className="h-4 w-4" />
+                    Edit
+                  </button>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      setOpenRowMenuId(null);
+                      await removeAsset(asset.id);
+                    }}
+                    className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                    Delete
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          );
+        },
       }),
     ];
-  }, [baseCurrency, getConvertedValue, getDisplayCurrency, handleRefreshRow, onEditAsset, rates, refreshFailedPrices, refreshingRowIds, removeAsset]);
+  }, [baseCurrency, duplicateAsset, getConvertedValue, getDisplayCurrency, handleRefreshRow, onEditAsset, openRowMenuId, rates, refreshFailedPrices, refreshingRowIds, removeAsset]);
 
   const canadaAssets = useMemo(
     () => filteredAssets.filter((asset) => asset.country === 'Canada'),
@@ -451,6 +515,29 @@ export function Ledger({ onEditAsset }: { onEditAsset?: (asset: Asset) => void }
     () => filteredAssets.filter((asset) => asset.country === 'India'),
     [filteredAssets],
   );
+  const failedAssets = useMemo(
+    () => filteredAssets.filter((asset) => asset.priceFetchStatus === 'failed'),
+    [filteredAssets],
+  );
+  const manualAssets = useMemo(
+    () => filteredAssets.filter((asset) => !asset.autoUpdate),
+    [filteredAssets],
+  );
+  const statsModalAssets = statsModal.type === 'failed'
+    ? failedAssets
+    : statsModal.type === 'manual'
+      ? manualAssets
+      : filteredAssets;
+  const statsModalTitle = statsModal.type === 'failed'
+    ? 'Failed Price Rows'
+    : statsModal.type === 'manual'
+      ? 'Manual Pricing Rows'
+      : 'All Filtered Rows';
+  const statsModalDescription = statsModal.type === 'failed'
+    ? 'These rows currently have failed ticker refreshes. You can jump straight into fixing them.'
+    : statsModal.type === 'manual'
+      ? 'These rows are set to manual pricing and will not use ticker refreshes.'
+      : 'These are the rows currently included by your active table filters.';
 
   const canadaTable = useReactTable<Asset>({
     data: canadaAssets,
@@ -537,9 +624,9 @@ export function Ledger({ onEditAsset }: { onEditAsset?: (asset: Asset) => void }
 
             <div className="rounded-3xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900">
               <div className="mt-4 grid gap-3 sm:grid-cols-3">
-                <StatPill label="Rows" value={String(filteredAssets.length)} />
-                <StatPill label="Failed" value={String(filteredAssets.filter((asset) => asset.priceFetchStatus === 'failed').length)} />
-                <StatPill label="Manual" value={String(filteredAssets.filter((asset) => !asset.autoUpdate).length)} />
+                <StatPill label="Rows" value={String(filteredAssets.length)} onClick={() => setStatsModal({ type: 'rows', open: true })} />
+                <StatPill label="Failed" value={String(failedAssets.length)} onClick={() => setStatsModal({ type: 'failed', open: true })} />
+                <StatPill label="Manual" value={String(manualAssets.length)} onClick={() => setStatsModal({ type: 'manual', open: true })} />
               </div>
               <div className="mt-4 text-sm text-slate-500 dark:text-slate-400">
                 Canada assets appear first, followed by India. Use the header filter icons for Excel-style column filtering and quick value selection.
@@ -672,19 +759,19 @@ export function Ledger({ onEditAsset }: { onEditAsset?: (asset: Asset) => void }
                       <div>{asset.comments || '-'}</div>
                     </div>
                     <div>
-                      <div className="text-slate-500">Investment Total</div>
+                      <div className="text-slate-500">{isDebtAssetClass(asset.assetClass) ? 'Debt Balance' : 'Investment Total'}</div>
                       <div className={isDebtAssetClass(asset.assetClass) ? 'font-medium text-red-500' : ''}>{formatCurrency(investmentTotal, displayCurrency)}</div>
                     </div>
                     <div>
-                      <div className="text-slate-500">Investment Price</div>
+                      <div className="text-slate-500">{isDebtAssetClass(asset.assetClass) ? 'Balance per Unit' : 'Investment Price'}</div>
                       <div className={isDebtAssetClass(asset.assetClass) ? 'font-medium text-red-500' : ''}>{formatCurrency(investmentPrice, displayCurrency)}</div>
                     </div>
                     <div>
-                      <div className="text-slate-500">Current Price</div>
+                      <div className="text-slate-500">{isDebtAssetClass(asset.assetClass) ? 'Current Balance per Unit' : 'Current Price'}</div>
                       <div className={isDebtAssetClass(asset.assetClass) ? 'font-medium text-red-500' : ''}>{asset.currentPrice ? formatCurrency(currentPrice, displayCurrency) : '-'}</div>
                     </div>
                     <div>
-                      <div className="text-slate-500">Current Total</div>
+                      <div className="text-slate-500">{isDebtAssetClass(asset.assetClass) ? 'Current Debt' : 'Current Total'}</div>
                       <div className={`font-semibold ${isDebtAssetClass(asset.assetClass) ? 'text-red-500' : ''}`}>{formatCurrency(currentTotal, displayCurrency)}</div>
                     </div>
                     <div>
@@ -695,7 +782,7 @@ export function Ledger({ onEditAsset }: { onEditAsset?: (asset: Asset) => void }
                     </div>
                     <div>
                       <div className="text-slate-500">XIRR</div>
-                      <div>{formatPercent(xirr)}</div>
+                      <div>{isDebtAssetClass(asset.assetClass) ? 'Not applicable for debt' : formatPercent(xirr)}</div>
                     </div>
                   </div>
                 </div>
@@ -716,8 +803,95 @@ export function Ledger({ onEditAsset }: { onEditAsset?: (asset: Asset) => void }
           }
         }}
       />
+
+      <Dialog open={statsModal.open} onOpenChange={(open) => setStatsModal((current) => ({ ...current, open }))}>
+        <DialogHeader>
+          <DialogTitle>{statsModalTitle}</DialogTitle>
+          <DialogDescription>{statsModalDescription}</DialogDescription>
+        </DialogHeader>
+        <div className="max-h-[65vh] space-y-3 overflow-y-auto pr-1">
+          {statsModalAssets.length ? (
+            statsModalAssets.map((asset) => {
+              const isRowRefreshing = refreshingRowIds.includes(asset.id);
+              const supportsTickerPricing = showsTickerManagement(asset);
+              return (
+                <div key={asset.id} className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-950">
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-semibold text-slate-900 dark:text-slate-100">{asset.name}</div>
+                      <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                        {getCanonicalAssetClass(asset.assetClass)} • {asset.owner} • {asset.country}
+                        {asset.ticker ? ` • ${asset.ticker}` : ''}
+                      </div>
+                      <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+                        {asset.autoUpdate ? (
+                          asset.priceFetchStatus === 'failed'
+                            ? <span className="text-amber-600">{getVisiblePriceFetchMessage(asset, priceProviderSettings)}</span>
+                            : 'Live price enabled'
+                        ) : 'Manual pricing'}
+                      </div>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {supportsTickerPricing ? (
+                        <>
+                          <Button variant="outline" size="sm" onClick={() => setTickerRepairAsset(asset)}>
+                            {asset.ticker ? 'Modify ticker' : 'Add ticker'}
+                          </Button>
+                          {asset.ticker ? (
+                            <Button variant="outline" size="sm" onClick={() => void handleRefreshRow(asset.id)} disabled={isRowRefreshing}>
+                              <RefreshCw className={`mr-2 h-3.5 w-3.5 ${isRowRefreshing ? 'animate-spin' : ''}`} />
+                              Refresh row
+                            </Button>
+                          ) : null}
+                        </>
+                      ) : null}
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => {
+                          setStatsModal((current) => ({ ...current, open: false }));
+                          onEditAsset?.(asset);
+                        }}
+                      >
+                        <Edit className="mr-2 h-3.5 w-3.5" />
+                        Edit
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })
+          ) : (
+            <div className="rounded-2xl border border-dashed border-slate-200 px-4 py-10 text-center text-sm text-slate-500 dark:border-slate-800 dark:text-slate-400">
+              No rows match this summary right now.
+            </div>
+          )}
+        </div>
+      </Dialog>
     </div>
   );
+}
+
+function getVisiblePriceFetchMessage(asset: Asset, priceProviderSettings: { alphaVantageApiKey: string; finnhubApiKey: string; primaryProvider: string; secondaryProvider: string }) {
+  const rawMessage = asset.priceFetchMessage || 'Price fetch failed.';
+
+  if (
+    asset.preferredPriceProvider === 'alphavantage' &&
+    !priceProviderSettings.alphaVantageApiKey?.trim() &&
+    rawMessage.toLowerCase().includes('missing alpha vantage api key')
+  ) {
+    return 'Saved provider Alpha Vantage is not configured. Refresh row will use Yahoo fallback.';
+  }
+
+  if (
+    asset.preferredPriceProvider === 'finnhub' &&
+    !priceProviderSettings.finnhubApiKey?.trim() &&
+    rawMessage.toLowerCase().includes('missing finnhub api key')
+  ) {
+    return 'Saved provider Finnhub is not configured. Refresh row will use Yahoo fallback.';
+  }
+
+  return rawMessage;
 }
 
 function FilterChip({ active, children, onClick }: React.PropsWithChildren<{ active: boolean; onClick: () => void }>) {
@@ -732,12 +906,16 @@ function FilterChip({ active, children, onClick }: React.PropsWithChildren<{ act
   );
 }
 
-function StatPill({ label, value }: React.PropsWithChildren<{ label: string; value: string }>) {
+function StatPill({ label, value, onClick }: React.PropsWithChildren<{ label: string; value: string; onClick?: () => void }>) {
   return (
-    <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3 dark:border-slate-800 dark:bg-slate-950">
+    <button
+      type="button"
+      onClick={onClick}
+      className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-left transition-colors hover:border-slate-300 hover:bg-slate-50 dark:border-slate-800 dark:bg-slate-950 dark:hover:border-slate-700 dark:hover:bg-slate-900"
+    >
       <div className="text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-500 dark:text-slate-400">{label}</div>
       <div className="mt-1 text-xl font-semibold text-slate-900 dark:text-slate-100">{value}</div>
-    </div>
+    </button>
   );
 }
 
@@ -776,7 +954,12 @@ function CountryTableSection({
         <h2 className="text-xl font-semibold text-slate-900 dark:text-slate-100">{title}</h2>
         <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">{subtitle}</p>
       </div>
-      <Table className="w-full">
+      <Table className="w-full table-fixed">
+        <colgroup>
+          {TABLE_COLUMN_WIDTHS.map((width) => (
+            <col key={width} style={{ width }} />
+          ))}
+        </colgroup>
         <TableHeader className="sticky top-0 z-10 bg-white/95 backdrop-blur dark:bg-slate-950/95">
           {table.getHeaderGroups().map((headerGroup) => (
             <TableRow key={headerGroup.id}>

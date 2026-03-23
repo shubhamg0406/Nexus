@@ -5,7 +5,7 @@ import { Button } from './ui/button';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from './ui/card';
 import { Download, Upload, Trash2, Users, PieChart, TrendingUp, Plus, RefreshCw, UserPlus, Shield, UserX } from 'lucide-react';
 import { GoogleDriveSync } from './GoogleDriveSync';
-import { Asset, AssetClassDef } from '../store/db';
+import { Asset, AssetClassDef, getAllAssetClasses, getAllAssets, getSetting } from '../store/db';
 import { Dialog, DialogHeader, DialogTitle, DialogDescription } from './ui/dialog';
 import { DEFAULT_PRICE_PROVIDER_SETTINGS, PriceProvider, PriceProviderSettings, fetchHistoricalExchangeRate } from '../lib/api';
 import { AddAssetClassModal } from './AddAssetClassModal';
@@ -20,6 +20,7 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
   const {
     importAssets,
     importAssetClasses,
+    replaceCloudPortfolio,
     removeAssetClass,
     clearAllAssets,
     clearAllAssetClasses,
@@ -28,6 +29,7 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
     refreshPrices,
     isRefreshing,
     rates,
+    baseCurrency,
     priceProviderSettings,
     updatePriceProviderSettings,
     members,
@@ -47,10 +49,30 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
   const [providerForm, setProviderForm] = React.useState<PriceProviderSettings>(DEFAULT_PRICE_PROVIDER_SETTINGS);
   const [inviteEmail, setInviteEmail] = React.useState('');
   const [inviteRole, setInviteRole] = React.useState<'owner' | 'partner'>('partner');
+  const [migrationPreview, setMigrationPreview] = React.useState<{
+    loading: boolean;
+    localAssets: Asset[];
+    localClasses: AssetClassDef[];
+    localBaseCurrency: 'CAD' | 'INR' | 'USD' | 'ORIGINAL' | null;
+    localPriceProviderSettings: PriceProviderSettings | null;
+  }>({
+    loading: true,
+    localAssets: [],
+    localClasses: [],
+    localBaseCurrency: null,
+    localPriceProviderSettings: null,
+  });
+  const [replaceConfirmText, setReplaceConfirmText] = React.useState('');
+  const [isReplacingCloud, setIsReplacingCloud] = React.useState(false);
+  const [migrationSource, setMigrationSource] = React.useState<'screen' | 'local'>('screen');
 
   React.useEffect(() => {
     setProviderForm(priceProviderSettings);
   }, [priceProviderSettings]);
+
+  React.useEffect(() => {
+    void loadMigrationPreview();
+  }, []);
 
   React.useEffect(() => {
     if (!initialSection) return;
@@ -499,6 +521,68 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
     setAlertDialog({ open: true, title: 'Member Added', description: `${normalizedEmail} can now access this shared portfolio.` });
   };
 
+  const loadMigrationPreview = async () => {
+    setMigrationPreview((current) => ({ ...current, loading: true }));
+    try {
+      const [localAssets, localClasses, localBaseCurrency, localProviderSettings] = await Promise.all([
+        getAllAssets(),
+        getAllAssetClasses(),
+        getSetting<'CAD' | 'INR' | 'USD' | 'ORIGINAL'>('baseCurrency'),
+        getSetting<PriceProviderSettings>('priceProviderSettings'),
+      ]);
+
+      setMigrationPreview({
+        loading: false,
+        localAssets,
+        localClasses,
+        localBaseCurrency: localBaseCurrency || null,
+        localPriceProviderSettings: localProviderSettings || null,
+      });
+    } catch {
+      setMigrationPreview({
+        loading: false,
+        localAssets: [],
+        localClasses: [],
+        localBaseCurrency: null,
+        localPriceProviderSettings: null,
+      });
+    }
+  };
+
+  const handleReplaceCloudPortfolio = async () => {
+    if (replaceConfirmText.trim() !== 'REPLACE') return;
+    setIsReplacingCloud(true);
+    const sourceAssets = migrationSource === 'screen' ? assets : migrationPreview.localAssets;
+    const sourceAssetClasses = migrationSource === 'screen' ? assetClasses : migrationPreview.localClasses;
+    const sourceBaseCurrency = migrationSource === 'screen' ? baseCurrency : migrationPreview.localBaseCurrency || undefined;
+    const sourcePriceProviderSettings = migrationSource === 'screen'
+      ? priceProviderSettings
+      : migrationPreview.localPriceProviderSettings || undefined;
+    try {
+      await replaceCloudPortfolio({
+        assets: sourceAssets,
+        assetClasses: sourceAssetClasses,
+        baseCurrency: sourceBaseCurrency,
+        priceProviderSettings: sourcePriceProviderSettings,
+      });
+      setReplaceConfirmText('');
+      setConfirmDialog({ open: false, title: '', description: '', onConfirm: () => {} });
+      setAlertDialog({
+        open: true,
+        title: 'Cloud Replaced',
+        description: `Live Firebase data now matches your ${migrationSource === 'screen' ? 'current app view' : 'browser local snapshot'}: ${sourceAssets.length} assets and ${sourceAssetClasses.length} asset classes.`,
+      });
+    } catch (error) {
+      setAlertDialog({
+        open: true,
+        title: 'Replacement Failed',
+        description: error instanceof Error ? error.message : 'Could not replace live Firebase data.',
+      });
+    } finally {
+      setIsReplacingCloud(false);
+    }
+  };
+
   return (
     <div className="space-y-6 max-w-5xl mx-auto pb-12">
       <div className="flex justify-between items-center mb-8">
@@ -801,6 +885,84 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
 
       <Card className="border-none shadow-sm rounded-2xl">
         <CardHeader>
+          <CardTitle>Local To Cloud Migration</CardTitle>
+          <CardDescription>Replace the live Firebase portfolio using either the portfolio currently loaded on screen or the browser IndexedDB snapshot from this device.</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-5">
+          <div className="flex flex-wrap gap-2">
+            <Button
+              type="button"
+              variant={migrationSource === 'screen' ? 'default' : 'outline'}
+              className={`rounded-full ${migrationSource === 'screen' ? 'bg-[#00875A] text-white hover:bg-[#007A51]' : ''}`}
+              onClick={() => setMigrationSource('screen')}
+            >
+              Use Current App Data
+            </Button>
+            <Button
+              type="button"
+              variant={migrationSource === 'local' ? 'default' : 'outline'}
+              className={`rounded-full ${migrationSource === 'local' ? 'bg-[#00875A] text-white hover:bg-[#007A51]' : ''}`}
+              onClick={() => setMigrationSource('local')}
+            >
+              Use Browser Local Snapshot
+            </Button>
+          </div>
+          <div className="grid gap-4 md:grid-cols-2">
+            <div className={`rounded-2xl border p-4 ${migrationSource === 'screen' ? 'border-emerald-300 bg-emerald-50 dark:border-emerald-900 dark:bg-emerald-950/20' : 'border-slate-200 bg-slate-50 dark:border-slate-800 dark:bg-slate-900'}`}>
+              <div className="mb-3 text-sm font-semibold text-slate-900 dark:text-white">Current App Portfolio (On Screen)</div>
+              <div className="space-y-2 text-sm text-slate-600 dark:text-slate-300">
+                <div>Assets: <span className="font-semibold text-slate-900 dark:text-white">{assets.length}</span></div>
+                <div>Asset Classes: <span className="font-semibold text-slate-900 dark:text-white">{assetClasses.length}</span></div>
+                <div>Base Currency: <span className="font-semibold text-slate-900 dark:text-white">{baseCurrency}</span></div>
+                <div>Primary Provider: <span className="font-semibold text-slate-900 dark:text-white">{priceProviderSettings.primaryProvider}</span></div>
+              </div>
+            </div>
+            <div className={`rounded-2xl border p-4 ${migrationSource === 'local' ? 'border-emerald-300 bg-emerald-50 dark:border-emerald-900 dark:bg-emerald-950/20' : 'border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-950'}`}>
+              <div className="mb-3 text-sm font-semibold text-slate-900 dark:text-white">Browser Local IndexedDB Snapshot</div>
+              {migrationPreview.loading ? (
+                <p className="text-sm text-slate-500">Loading browser local data...</p>
+              ) : (
+                <div className="space-y-2 text-sm text-slate-600 dark:text-slate-300">
+                  <div>Assets: <span className="font-semibold text-slate-900 dark:text-white">{migrationPreview.localAssets.length}</span></div>
+                  <div>Asset Classes: <span className="font-semibold text-slate-900 dark:text-white">{migrationPreview.localClasses.length}</span></div>
+                  <div>Base Currency: <span className="font-semibold text-slate-900 dark:text-white">{migrationPreview.localBaseCurrency || 'Not stored locally'}</span></div>
+                  <div>Primary Provider: <span className="font-semibold text-slate-900 dark:text-white">{migrationPreview.localPriceProviderSettings?.primaryProvider || 'Not stored locally'}</span></div>
+                </div>
+              )}
+            </div>
+          </div>
+          <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200">
+            This is a full replacement. It overwrites cloud assets, asset classes, base currency, and price-provider settings with the selected source. Member access stays intact so you do not lose login access.
+          </div>
+          <div className="flex flex-wrap gap-3">
+            <Button variant="outline" onClick={() => void loadMigrationPreview()}>
+              <RefreshCw className="mr-2 h-4 w-4" />
+              Refresh Snapshot
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={migrationPreview.loading}
+              onClick={() => {
+                setReplaceConfirmText('');
+                const sourceAssetsCount = migrationSource === 'screen' ? assets.length : migrationPreview.localAssets.length;
+                const sourceClassesCount = migrationSource === 'screen' ? assetClasses.length : migrationPreview.localClasses.length;
+                setConfirmDialog({
+                  open: true,
+                  title: 'Replace Live Portfolio',
+                  description: `Type REPLACE to overwrite the live Firebase portfolio with ${sourceAssetsCount} assets and ${sourceClassesCount} asset classes from the ${migrationSource === 'screen' ? 'current app view' : 'browser local snapshot'}.`,
+                  onConfirm: () => {},
+                });
+              }}
+            >
+              <Upload className="mr-2 h-4 w-4" />
+              Push Selected Data To Cloud
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card className="border-none shadow-sm rounded-2xl">
+        <CardHeader>
           <CardTitle>Holdings Data</CardTitle>
           <CardDescription>Import, export, or erase your asset holdings.</CardDescription>
         </CardHeader>
@@ -904,10 +1066,25 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
           <DialogTitle>{confirmDialog.title}</DialogTitle>
           <DialogDescription>{confirmDialog.description}</DialogDescription>
         </DialogHeader>
-        <div className="flex justify-end gap-2 mt-4">
-          <Button variant="outline" onClick={() => setConfirmDialog(prev => ({ ...prev, open: false }))}>Cancel</Button>
-          <Button variant="destructive" onClick={confirmDialog.onConfirm}>Confirm</Button>
-        </div>
+        {confirmDialog.title === 'Replace Live Portfolio' ? (
+          <div className="mt-4 space-y-4">
+            <div className="space-y-2">
+              <label className="text-sm font-medium">Type REPLACE to confirm</label>
+              <Input value={replaceConfirmText} onChange={(event) => setReplaceConfirmText(event.target.value)} placeholder="REPLACE" />
+            </div>
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={() => setConfirmDialog(prev => ({ ...prev, open: false }))}>Cancel</Button>
+              <Button variant="destructive" disabled={replaceConfirmText.trim() !== 'REPLACE' || isReplacingCloud} onClick={() => void handleReplaceCloudPortfolio()}>
+                {isReplacingCloud ? 'Replacing...' : 'Replace Live Data'}
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <div className="flex justify-end gap-2 mt-4">
+            <Button variant="outline" onClick={() => setConfirmDialog(prev => ({ ...prev, open: false }))}>Cancel</Button>
+            <Button variant="destructive" onClick={confirmDialog.onConfirm}>Confirm</Button>
+          </div>
+        )}
       </Dialog>
 
       <Dialog open={alertDialog.open} onOpenChange={(open) => setAlertDialog(prev => ({ ...prev, open }))}>

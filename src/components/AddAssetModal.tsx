@@ -9,6 +9,7 @@ import { Calculator, Search } from 'lucide-react';
 import { AssetClassLogo } from '../lib/assetClassBranding';
 import { getSystemAssetClassesForCountry } from '../lib/systemAssetClasses';
 import { PriceProvider } from '../lib/api';
+import { getCurrencyOptionsForCountry, getDefaultCurrencyForCountry } from './addAssetModalHelpers';
 
 interface AddAssetModalProps {
   open: boolean;
@@ -35,10 +36,16 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
   const [comments, setComments] = useState('');
   const [preferredPriceProvider, setPreferredPriceProvider] = useState<PriceProvider>('yahoo');
 
-  const ownerOptions = useMemo(
-    () => Array.from(new Set(assets.map((asset) => asset.owner).filter(Boolean))).map(String).sort(),
-    [assets],
-  );
+  const ownerOptions = useMemo(() => {
+    const options = Array.from(new Set(assets.map((asset) => asset.owner).filter(Boolean))).map(String).sort();
+    if (assetToEdit?.owner && !options.includes(assetToEdit.owner)) {
+      options.push(assetToEdit.owner);
+      options.sort();
+    }
+    return options.length > 0 ? options : ['Joint'];
+  }, [assetToEdit?.owner, assets]);
+
+  const currencyOptions = useMemo(() => getCurrencyOptionsForCountry(country), [country]);
 
   useEffect(() => {
     if (assetToEdit && open) {
@@ -48,7 +55,7 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
       setQuantity(assetToEdit.quantity.toString());
       setAveragePurchasePrice(assetToEdit.quantity ? (assetToEdit.costBasis / assetToEdit.quantity).toString() : '');
       setPurchaseValue(assetToEdit.costBasis.toString());
-      setCurrency(assetToEdit.currency as any);
+      setCurrency(getDefaultCurrencyForCountry(assetToEdit.country as 'India' | 'Canada', assetToEdit.currency as 'CAD' | 'INR' | 'USD'));
       setOwner(assetToEdit.owner);
       setCountry(assetToEdit.country as any);
       setAssetClass(assetToEdit.assetClass);
@@ -78,7 +85,7 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
     ...systemAssetClasses.map(c => c.name),
     ...defaultClasses,
     ...(assetClass ? [assetClass] : [])
-  ]));
+  ])).sort((left, right) => left.localeCompare(right));
   const selectedAssetClassDef = [...customAssetClasses, ...systemAssetClasses].find((cls) => cls.country === country && cls.name === assetClass);
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -131,8 +138,8 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
     setQuantity('');
     setAveragePurchasePrice('');
     setPurchaseValue('');
-    setCurrency('USD');
-    setOwner('Joint');
+    setCurrency('INR');
+    setOwner(ownerOptions[0] || 'Joint');
     setCountry('India');
     setAssetClass('Mutual Funds');
     setAutoUpdate(true);
@@ -160,11 +167,13 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
           <div className="space-y-2">
             <label className="text-sm font-medium">Country</label>
             <Select value={country} onChange={(e) => {
-              setCountry(e.target.value as any);
+              const nextCountry = e.target.value as 'India' | 'Canada';
+              setCountry(nextCountry);
+              setCurrency(getDefaultCurrencyForCountry(nextCountry));
               // Reset asset class if it's not in the new country's list
-              const newAvailableClasses = customAssetClasses.filter(c => c.country === e.target.value);
-              const newSystemClasses = getSystemAssetClassesForCountry(e.target.value);
-              const newDefaultClasses = e.target.value === 'Canada' 
+              const newAvailableClasses = customAssetClasses.filter(c => c.country === nextCountry);
+              const newSystemClasses = getSystemAssetClassesForCountry(nextCountry);
+              const newDefaultClasses = nextCountry === 'Canada' 
                 ? ['TFSA', 'Credit Card']
                 : ['Mutual Funds', 'Stocks', 'Credit Card'];
               const newDisplayClasses = Array.from(new Set([...newAvailableClasses.map(c => c.name), ...newSystemClasses.map(c => c.name), ...newDefaultClasses]));
@@ -203,19 +212,20 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
         <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1.15fr)_minmax(240px,0.47fr)]">
           <div className="space-y-2">
             <label className="text-sm font-medium">Owner</label>
-            <Input required list="owner-options" value={owner} onChange={(e) => setOwner(e.target.value)} placeholder="e.g. Joint, Shubham..." />
-            <datalist id="owner-options">
+            <Select required value={owner} onChange={(e) => setOwner(e.target.value)}>
               {ownerOptions.map((option) => (
-                <option key={option} value={option} />
+                <option key={option} value={option}>
+                  {option}
+                </option>
               ))}
-            </datalist>
+            </Select>
           </div>
           <div className="space-y-2">
             <label className="text-sm font-medium">Currency</label>
             <Select value={currency} onChange={(e) => setCurrency(e.target.value as any)}>
-              <option value="USD">USD</option>
-              <option value="CAD">CAD</option>
-              <option value="INR">INR</option>
+              {currencyOptions.map((option) => (
+                <option key={option} value={option}>{option}</option>
+              ))}
             </Select>
           </div>
         </div>

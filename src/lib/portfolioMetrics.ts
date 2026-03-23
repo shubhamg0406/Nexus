@@ -48,16 +48,31 @@ function applyAssetClassSign(assetClass: string, amount: number) {
   return isDebtAssetClass(assetClass) ? -Math.abs(amount) : amount;
 }
 
+function getFallbackUnitPrice(asset: Asset) {
+  if (asset.quantity && Number.isFinite(asset.quantity) && asset.quantity !== 0) {
+    return asset.costBasis / asset.quantity;
+  }
+  return asset.costBasis;
+}
+
 export function getInvestmentTotal(asset: Asset) {
   return applyAssetClassSign(asset.assetClass, asset.costBasis);
 }
 
 export function getCurrentPrice(asset: Asset) {
-  return applyAssetClassSign(asset.assetClass, asset.currentPrice || 0);
+  const currentUnitPrice =
+    typeof asset.currentPrice === 'number' && Number.isFinite(asset.currentPrice)
+      ? asset.currentPrice
+      : getFallbackUnitPrice(asset);
+  return applyAssetClassSign(asset.assetClass, currentUnitPrice);
 }
 
 export function getCurrentTotal(asset: Asset) {
-  return applyAssetClassSign(asset.assetClass, asset.quantity * Math.abs(asset.currentPrice || 0));
+  const rawCurrentTotal =
+    typeof asset.currentPrice === 'number' && Number.isFinite(asset.currentPrice)
+      ? asset.quantity * Math.abs(asset.currentPrice)
+      : asset.costBasis;
+  return applyAssetClassSign(asset.assetClass, rawCurrentTotal);
 }
 
 export function getPreviousClose(asset: Asset) {
