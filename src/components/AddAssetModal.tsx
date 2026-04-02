@@ -8,7 +8,7 @@ import { Select } from './ui/select';
 import { Calculator, Search } from 'lucide-react';
 import { AssetClassLogo } from '../lib/assetClassBranding';
 import { getSystemAssetClassesForCountry } from '../lib/systemAssetClasses';
-import { PriceProvider } from '../lib/api';
+import { PriceProvider, hasConfiguredNonYahooProvider } from '../lib/api';
 import { getCurrencyOptionsForCountry, getDefaultCurrencyForCountry } from './addAssetModalHelpers';
 
 interface AddAssetModalProps {
@@ -35,6 +35,10 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
   const [holdingPlatform, setHoldingPlatform] = useState('');
   const [comments, setComments] = useState('');
   const [preferredPriceProvider, setPreferredPriceProvider] = useState<PriceProvider>('yahoo');
+  const defaultPreferredProvider =
+    hasConfiguredNonYahooProvider(priceProviderSettings) && priceProviderSettings.primaryProvider === 'yahoo'
+      ? (priceProviderSettings.finnhubApiKey?.trim() ? 'finnhub' : 'alphavantage')
+      : priceProviderSettings.primaryProvider;
 
   const ownerOptions = useMemo(() => {
     const options = Array.from(new Set(assets.map((asset) => asset.owner).filter(Boolean))).map(String).sort();
@@ -64,11 +68,11 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
       setCurrentValue(assetToEdit.currentPrice ? (assetToEdit.currentPrice * assetToEdit.quantity).toString() : '');
       setHoldingPlatform(assetToEdit.holdingPlatform || '');
       setComments(assetToEdit.comments || '');
-      setPreferredPriceProvider(assetToEdit.preferredPriceProvider || priceProviderSettings.primaryProvider);
+      setPreferredPriceProvider(assetToEdit.preferredPriceProvider || defaultPreferredProvider);
     } else if (open && !assetToEdit) {
       resetForm();
     }
-  }, [assetToEdit, open, priceProviderSettings.primaryProvider]);
+  }, [assetToEdit, defaultPreferredProvider, open, priceProviderSettings.primaryProvider]);
 
   // Filter custom asset classes by selected country
   const availableAssetClasses = customAssetClasses.filter(c => c.country === country);
@@ -97,11 +101,12 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
       : resolveCurrentTriangle(resolvedPurchase.quantity, currentPrice, currentValue);
 
     const normalizedTicker = ticker.trim() || undefined;
+    const isGoldAsset = assetClass === 'Gold';
     const hasTickerControls = isTickerApplicable || Boolean(assetToEdit?.ticker) || Boolean(ticker.trim());
 
     const assetData = {
       name,
-      ticker: hasTickerControls ? normalizedTicker : undefined,
+      ticker: isGoldAsset ? undefined : (hasTickerControls ? normalizedTicker : undefined),
       quantity: resolvedPurchase.quantity,
       costBasis: resolvedPurchase.value,
       currency,
@@ -113,7 +118,7 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
       purchaseDate: purchaseDate || undefined,
       holdingPlatform: holdingPlatform.trim() || undefined,
       comments: comments.trim() || undefined,
-      preferredPriceProvider: hasTickerControls ? preferredPriceProvider : undefined,
+      preferredPriceProvider: isGoldAsset ? undefined : (hasTickerControls ? preferredPriceProvider : undefined),
     };
 
     if (assetToEdit) {
@@ -147,11 +152,11 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
     setCurrentValue('');
     setHoldingPlatform('');
     setComments('');
-    setPreferredPriceProvider(priceProviderSettings.primaryProvider);
+    setPreferredPriceProvider(defaultPreferredProvider);
   };
 
   const isTickerApplicable = !['Gold', 'Cash', 'PF/NPS/FD', 'TFSA/RRSP/FHSA', 'Real Estate', 'Other', 'Credit Card'].includes(assetClass);
-  const showTickerControls = isTickerApplicable || Boolean(ticker) || Boolean(assetToEdit?.ticker);
+  const showTickerControls = isTickerApplicable;
 
   const purchaseSummary = resolvePurchaseTriangle(quantity, averagePurchasePrice, purchaseValue);
   const currentSummary = autoUpdate ? null : resolveCurrentTriangle(purchaseSummary.quantity, currentPrice, currentValue);

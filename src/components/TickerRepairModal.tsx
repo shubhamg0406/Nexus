@@ -1,8 +1,8 @@
 import React from 'react';
-import { AlertTriangle, ArrowRight, CheckCircle2, Coins, Loader2, Ruler, Search, Sigma } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, ChevronDown, Loader2, Search } from 'lucide-react';
 import { Asset } from '../store/db';
 import { usePortfolio } from '../store/PortfolioContext';
-import { fetchStockPrice, getTickerRecommendation, inferCurrencyFromTicker, PriceFetchResult, PriceProvider } from '../lib/api';
+import { fetchAutoMatchedPriceForAsset, fetchGoldSystemQuote, getTickerRecommendation, hasConfiguredNonYahooProvider, inferCurrencyFromTicker, PriceFetchResult, PriceProvider, ResolvedPriceProvider } from '../lib/api';
 import { Dialog, DialogDescription, DialogHeader, DialogTitle } from './ui/dialog';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
@@ -30,9 +30,15 @@ export function TickerRepairModal({ asset, open, onOpenChange }: TickerRepairMod
   const [customUnitFactor, setCustomUnitFactor] = React.useState('');
   const [fromCurrency, setFromCurrency] = React.useState<SupportedCurrency>('USD');
   const [toCurrency, setToCurrency] = React.useState<SupportedCurrency>('USD');
-  const [priceFormula, setPriceFormula] = React.useState('{price}');
+  const [priceFormula, setPriceFormula] = React.useState('({price} / {unit}) * {fx}');
   const [isChecking, setIsChecking] = React.useState(false);
+  const [isSaving, setIsSaving] = React.useState(false);
   const [result, setResult] = React.useState<PriceFetchResult | null>(null);
+  const defaultPreferredProvider =
+    hasConfiguredNonYahooProvider(priceProviderSettings) && priceProviderSettings.primaryProvider === 'yahoo'
+      ? (priceProviderSettings.finnhubApiKey?.trim() ? 'finnhub' : 'alphavantage')
+      : priceProviderSettings.primaryProvider;
+  const isGoldAsset = asset?.assetClass === 'Gold';
 
   React.useEffect(() => {
     if (!asset || !open) return;
@@ -40,7 +46,7 @@ export function TickerRepairModal({ asset, open, onOpenChange }: TickerRepairMod
     setProvider(
       asset.preferredPriceProvider === 'alphavantage' || asset.preferredPriceProvider === 'finnhub' || asset.preferredPriceProvider === 'yahoo'
         ? asset.preferredPriceProvider
-        : priceProviderSettings.primaryProvider
+        : defaultPreferredProvider
     );
     setTicker(asset.ticker || '');
     setCalculationMode(asset.priceFormula ? 'formula' : 'guided');
@@ -60,7 +66,23 @@ export function TickerRepairModal({ asset, open, onOpenChange }: TickerRepairMod
     setToCurrency(asset.priceTargetCurrency || asset.currency);
     setPriceFormula(asset.priceFormula || '({price} / {unit}) * {fx}');
     setResult(null);
-  }, [asset, open, priceProviderSettings.primaryProvider]);
+    setIsChecking(false);
+    setIsSaving(false);
+  }, [asset, defaultPreferredProvider, open, priceProviderSettings.primaryProvider]);
+
+  React.useEffect(() => {
+    if (!asset || !open || !isGoldAsset) return;
+
+    setIsChecking(true);
+    void fetchGoldSystemQuote()
+      .then((quote) => {
+        setResult(quote);
+        setFromCurrency('USD');
+      })
+      .finally(() => {
+        setIsChecking(false);
+      });
+  }, [asset, isGoldAsset, open]);
 
   if (!asset) return null;
 
@@ -75,7 +97,6 @@ export function TickerRepairModal({ asset, open, onOpenChange }: TickerRepairMod
         : 1;
   const fxFactor = getFxConversionFactor(quoteCurrency, toCurrency, rates);
   const sourcePrice = result?.price ?? null;
-  const unitConvertedPrice = sourcePrice != null ? sourcePrice / unitFactor : null;
   const formulaResult = sourcePrice != null
     ? applyPriceFormula(priceFormula, {
         price: sourcePrice,
@@ -83,197 +104,266 @@ export function TickerRepairModal({ asset, open, onOpenChange }: TickerRepairMod
         unit: unitFactor,
       })
     : null;
-  const guidedConvertedPrice = unitConvertedPrice != null ? unitConvertedPrice * fxFactor : null;
-  const finalConvertedPrice = calculationMode === 'formula'
-    ? formulaResult?.value ?? null
-    : guidedConvertedPrice;
-  const canApply = result?.price != null && (calculationMode === 'guided' || !formulaResult?.error);
-  const finalUnitLabel = unitMode === 'ounce-to-gram' ? 'per gram' : 'per unit';
-  const liveMath = buildLiveMath({
-    calculationMode,
-    sourcePrice,
-    unitFactor,
-    fxFactor,
-    toCurrency,
-    finalPrice: finalConvertedPrice,
-    formulaResult: formulaResult?.resolvedExpression || '',
-  });
+  const finalConvertedPrice =
+    calculationMode === 'formula'
+      ? formulaResult?.value ?? null
+      : sourcePrice != null
+        ? (sourcePrice / unitFactor) * fxFactor
+        : null;
+  const canSave =
+    (isGoldAsset || Boolean(ticker.trim())) &&
+    (!result || result.price != null) &&
+    (calculationMode === 'guided' || !formulaResult?.error);
 
   const testTicker = async () => {
     setIsChecking(true);
     try {
-      const checked = await fetchStockPrice(ticker, provider, priceProviderSettings);
+      const checked = isGoldAsset
+        ? await fetchGoldSystemQuote()
+        : await fetchAutoMatchedPriceForAsset(
+            {
+              ...asset,
+              ticker,
+              preferredPriceProvider: provider,
+            },
+            priceProviderSettings,
+          );
       setResult(checked);
-      const resolvedCurrency = getResolvedQuoteCurrency(checked, ticker, asset, fromCurrency);
-      setFromCurrency(resolvedCurrency);
+      setFromCurrency(isGoldAsset ? 'USD' : getResolvedQuoteCurrency(checked, ticker, asset, fromCurrency));
+      if (!isGoldAsset && checked.price != null && (checked.provider === 'yahoo' || checked.provider === 'alphavantage' || checked.provider === 'finnhub') && checked.provider !== provider) {
+        setProvider(checked.provider);
+      }
     } finally {
       setIsChecking(false);
     }
   };
 
   const saveTicker = async () => {
-    let nextPrice = asset.currentPrice;
-    if (finalConvertedPrice != null) {
-      nextPrice = finalConvertedPrice;
+    setIsSaving(true);
+    try {
+      await updateAsset({
+        ...asset,
+        ticker: isGoldAsset ? undefined : (ticker.trim() || undefined),
+        autoUpdate: isGoldAsset ? true : Boolean(ticker.trim()),
+        currentPrice: finalConvertedPrice ?? asset.currentPrice,
+        preferredPriceProvider: isGoldAsset ? undefined : provider,
+        priceProvider: isGoldAsset ? 'gold' : provider,
+        priceFetchStatus: result?.price != null ? 'success' : asset.priceFetchStatus,
+        priceFetchMessage: result?.price != null ? undefined : result?.error || asset.priceFetchMessage,
+        priceUnitConversionFactor: unitFactor !== 1 ? unitFactor : undefined,
+        priceSourceCurrency: quoteCurrency,
+        priceTargetCurrency: toCurrency,
+        priceFormula: calculationMode === 'formula' ? priceFormula.trim() : undefined,
+        priceConversionFactor: calculationMode === 'formula' ? undefined : buildStoredConversionFactor({ unitFactor, fxFactor }),
+      });
+      onOpenChange(false);
+    } finally {
+      setIsSaving(false);
     }
-
-    await updateAsset({
-      ...asset,
-      ticker: ticker.trim() || undefined,
-      autoUpdate: Boolean(ticker.trim()),
-      currentPrice: nextPrice,
-      preferredPriceProvider: provider,
-      priceProvider: provider,
-      priceFetchStatus: result?.price != null ? 'success' : asset.priceFetchStatus,
-      priceFetchMessage: result?.price != null ? undefined : result?.error || asset.priceFetchMessage,
-      priceUnitConversionFactor: unitFactor !== 1 ? unitFactor : undefined,
-      priceSourceCurrency: quoteCurrency,
-      priceTargetCurrency: toCurrency,
-      priceFormula: calculationMode === 'formula' ? priceFormula.trim() : undefined,
-      // Backward-compatible final multiplier for existing refresh logic.
-      priceConversionFactor: calculationMode === 'formula' ? undefined : buildStoredConversionFactor({
-        unitFactor,
-        fxFactor,
-      }),
-    });
-
-    onOpenChange(false);
   };
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogHeader className="border-b border-slate-200/80 pb-5">
-        <DialogTitle className="text-2xl font-black tracking-tight text-slate-950">Fix Ticker Protocol</DialogTitle>
-        <DialogDescription className="max-w-3xl text-base leading-relaxed text-slate-600">
-          Refine live financial instrument data through source verification, clinical unit transformation, and real-time currency reconciliation.
+      <DialogHeader className="border-b border-slate-200 pb-4">
+        <DialogTitle className="text-xl font-semibold text-slate-950 dark:text-slate-50">{isGoldAsset ? 'Gold Price Settings' : 'Edit Ticker'}</DialogTitle>
+        <DialogDescription className="max-w-2xl text-sm leading-6 text-slate-600 dark:text-slate-400">
+          {isGoldAsset
+            ? `Gold uses the system source automatically for ${asset.name}. Adjust only the saved currency, unit conversion, or formula.`
+            : `Update the live price source for ${asset.name}. Most assets only need a ticker and provider.`}
         </DialogDescription>
       </DialogHeader>
 
-      <div className="min-h-0 flex-1 space-y-6 overflow-y-auto py-4 pr-1">
-        <div className="grid gap-5 xl:grid-cols-3">
-          <ProtocolPanel
-            step="Step 1"
-            title="Source Fetch"
-            icon={<Coins className="h-4 w-4" />}
-          >
-            <div className="space-y-5">
-              <FieldLabel>Instrument Ticker</FieldLabel>
-              <Input
-                value={ticker}
-                onChange={(event) => setTicker(event.target.value)}
-                placeholder="e.g. GC=F, NSE:RELIANCE, NASDAQ:AAPL"
-                className="h-14 rounded-2xl border-slate-200 bg-white text-lg"
-              />
-
-              <FieldLabel>Provider Source</FieldLabel>
-              <Select value={provider} onChange={(event) => setProvider(event.target.value as PriceProvider)}>
-                <option value="yahoo">Yahoo Finance</option>
-                <option value="alphavantage">Alpha Vantage</option>
-                <option value="finnhub">Finnhub</option>
-              </Select>
-
-              <Button
-                type="button"
-                onClick={() => void testTicker()}
-                disabled={isChecking || !ticker.trim()}
-                className="h-14 w-full rounded-2xl bg-[#6fbea4] text-lg font-semibold text-[#0b3b31] hover:bg-[#62b498]"
-              >
-                {isChecking ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Search className="mr-2 h-4 w-4" />}
-                Check Ticker
-              </Button>
-
-              <div className="rounded-3xl border border-slate-200 bg-slate-50 p-5 shadow-[inset_4px_0_0_0_#0f7a5b]">
-                <div className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">Raw Quote Output</div>
-                <div className="mt-3 flex flex-wrap items-end gap-3">
-                  <span className="font-mono text-3xl font-bold tracking-tight text-[#0b6a53]">
-                    {result?.price != null ? formatDecimal(result.price) : '--'}
-                  </span>
-                  <span className="pb-1 text-sm uppercase tracking-[0.18em] text-slate-500">
-                    {result?.price != null ? `${quoteCurrency} / ${unitMode === 'ounce-to-gram' ? 'oz' : 'unit'}` : 'Awaiting quote'}
-                  </span>
-                </div>
-                <div className="mt-3 text-sm text-slate-500">
-                  {result?.price != null ? (result.normalizedTicker || ticker) : recommendation}
-                </div>
-                {result?.sourceUrl ? (
-                  <a
-                    href={result.sourceUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="mt-3 inline-flex text-sm font-medium text-emerald-700 underline decoration-emerald-400 underline-offset-4"
-                  >
-                    Open source page
-                  </a>
-                ) : null}
-                {result?.price == null && result?.error ? (
-                  <div className="mt-3 inline-flex items-center gap-2 rounded-full bg-amber-50 px-3 py-2 text-sm font-medium text-amber-700">
-                    <AlertTriangle className="h-4 w-4" />
-                    {result.error}
+      <div className="min-h-0 flex-1 overflow-y-auto py-4">
+        <div className="space-y-4">
+          <section className="rounded-3xl border border-slate-200 bg-slate-50 p-5 dark:border-slate-800 dark:bg-slate-900/60">
+            {isGoldAsset ? (
+              <div className="flex flex-wrap items-end justify-between gap-4">
+                <div className="space-y-2">
+                  <FieldLabel>System Source</FieldLabel>
+                  <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-200">
+                    Gold API live gold feed
                   </div>
+                  <p className="text-xs leading-5 text-slate-500 dark:text-slate-400">
+                    Gold uses the shared system source. No ticker is needed.
+                  </p>
+                </div>
+                <Button type="button" onClick={() => void testTicker()} disabled={isChecking} className="h-11">
+                  {isChecking ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Search className="mr-2 h-4 w-4" />}
+                  Refresh preview
+                </Button>
+              </div>
+            ) : (
+              <>
+                <div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_220px_auto] md:items-end">
+                  <div className="space-y-2">
+                    <FieldLabel>Ticker</FieldLabel>
+                    <Input
+                      value={ticker}
+                      onChange={(event) => setTicker(event.target.value)}
+                      placeholder="e.g. GOOG, GOOG.TO, NSE:RELIANCE"
+                      className="h-11"
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <FieldLabel>Provider</FieldLabel>
+                    <Select value={provider} onChange={(event) => setProvider(event.target.value as PriceProvider)} className="h-11">
+                      <option value="yahoo">Yahoo Finance</option>
+                      <option value="alphavantage">Alpha Vantage</option>
+                      <option value="finnhub">Finnhub</option>
+                    </Select>
+                  </div>
+
+                  <Button type="button" onClick={() => void testTicker()} disabled={isChecking || !ticker.trim()} className="h-11 md:self-end">
+                    {isChecking ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Search className="mr-2 h-4 w-4" />}
+                    Check quote
+                  </Button>
+                </div>
+                <p className="mt-3 text-xs leading-5 text-slate-500 dark:text-slate-400">{recommendation}</p>
+              </>
+            )}
+          </section>
+
+          <section className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_280px]">
+            <div className="rounded-3xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-950">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <div className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500 dark:text-slate-400">Latest Quote</div>
+                  <div className="mt-1 text-2xl font-semibold tracking-tight text-slate-950 dark:text-slate-50">
+                    {result?.price != null ? formatDecimal(result.price) : '--'}
+                  </div>
+                  <div className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+                    {result?.price != null ? `${quoteCurrency} per ${unitMode === 'ounce-to-gram' ? 'ounce' : 'unit'}` : 'Run a quote check to preview the live price.'}
+                  </div>
+                </div>
+                {result?.price != null ? (
+                  <span className="inline-flex items-center gap-2 rounded-full bg-emerald-50 px-3 py-1 text-xs font-medium text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300">
+                    <CheckCircle2 className="h-3.5 w-3.5" />
+                    Quote found
+                  </span>
                 ) : null}
               </div>
+
+              {(result?.normalizedTicker || result?.price != null || result?.sourceUrl) ? (
+                <div className="mt-4 grid gap-2 text-sm text-slate-600 dark:text-slate-300 sm:grid-cols-2">
+                  {result?.normalizedTicker ? (
+                    <div className="rounded-2xl bg-slate-50 px-3 py-2 dark:bg-slate-900">
+                      <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500 dark:text-slate-400">Symbol</div>
+                      <div className="mt-1 font-medium text-slate-900 dark:text-slate-100">{result.normalizedTicker}</div>
+                    </div>
+                  ) : null}
+                  {result?.price != null ? (
+                    <div className="rounded-2xl bg-slate-50 px-3 py-2 dark:bg-slate-900">
+                      <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500 dark:text-slate-400">Source</div>
+                      <div className="mt-1 font-medium text-slate-900 dark:text-slate-100">{labelForProvider(result.provider)}</div>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+
+              {result?.sourceUrl ? (
+                <a
+                  href={result.sourceUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="mt-3 inline-flex text-sm font-medium text-slate-600 underline decoration-slate-300 underline-offset-4 hover:text-slate-950 dark:text-slate-300 dark:hover:text-slate-50"
+                >
+                  Open provider page
+                </a>
+              ) : null}
+
+              {result?.error ? (
+                <div className="mt-4 flex items-start gap-2 rounded-2xl bg-amber-50 px-3 py-3 text-sm text-amber-800 dark:bg-amber-950/30 dark:text-amber-200">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                  <span>{result.error}</span>
+                </div>
+              ) : null}
             </div>
-          </ProtocolPanel>
 
-          <ProtocolPanel
-            step="Step 2"
-            title="FX Conversion"
-            icon={<ArrowRight className="h-4 w-4" />}
-          >
-            <div className="space-y-5">
-              <div className="grid gap-4 md:grid-cols-2">
-                <div>
-                  <FieldLabel>From</FieldLabel>
-                  <Select value={fromCurrency} onChange={(event) => setFromCurrency(event.target.value as SupportedCurrency)}>
-                    <option value="USD">USD</option>
-                    <option value="CAD">CAD</option>
-                    <option value="INR">INR</option>
-                  </Select>
-                </div>
-                <div>
-                  <FieldLabel>To</FieldLabel>
-                  <Select value={toCurrency} onChange={(event) => setToCurrency(event.target.value as SupportedCurrency)}>
-                    <option value="USD">USD</option>
-                    <option value="CAD">CAD</option>
-                    <option value="INR">INR</option>
-                  </Select>
-                </div>
+            <aside className="rounded-3xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900/60">
+              <div className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500 dark:text-slate-400">Saved Price</div>
+              <div className="mt-1 text-2xl font-semibold tracking-tight text-slate-950 dark:text-slate-50">
+                {finalConvertedPrice != null ? `${currencySymbol(toCurrency)}${formatDecimal(finalConvertedPrice)}` : '--'}
+              </div>
+              <div className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+                {buildLiveMath({
+                  calculationMode,
+                  sourcePrice,
+                  unitFactor,
+                  fxFactor,
+                  toCurrency,
+                  finalPrice: finalConvertedPrice,
+                  formulaResult: formulaResult?.resolvedExpression || '',
+                }) || 'The saved price updates after a successful quote check.'}
               </div>
 
-              <div className="rounded-[26px] border border-slate-200 bg-white p-6 text-center shadow-sm">
-                <div className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">Institutional Rate</div>
-                <div className="mt-4 text-3xl font-black tracking-tight text-slate-950">
-                  1 {fromCurrency} = {formatDecimal(fxFactor, 4)} {toCurrency}
-                </div>
-                <div className="mt-5 inline-flex items-center gap-2 rounded-full bg-emerald-100 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.18em] text-emerald-700">
-                  <CheckCircle2 className="h-3.5 w-3.5" />
-                  Live Feed
+              <div className="mt-3 rounded-2xl bg-white p-3 text-sm text-slate-600 dark:bg-slate-950 dark:text-slate-300">
+                <div className="grid gap-2">
+                  <div>
+                    <span className="text-slate-500 dark:text-slate-400">Asset:</span>{' '}
+                    <span className="font-medium text-slate-900 dark:text-slate-100">{asset.name}</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-500 dark:text-slate-400">Currency:</span>{' '}
+                    <span className="font-medium">{toCurrency}</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-500 dark:text-slate-400">Qty:</span>{' '}
+                    <span className="font-medium">{formatDecimal(asset.quantity, 4)}</span>
+                  </div>
                 </div>
               </div>
+            </aside>
+          </section>
 
-              <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
-                Auto-filled from the fetched ticker currency, but editable if the provider metadata is wrong.
-              </div>
-            </div>
-          </ProtocolPanel>
+          <details className="group rounded-3xl border border-slate-200 bg-white px-5 py-4 dark:border-slate-800 dark:bg-slate-950">
+            <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-sm font-medium text-slate-900 dark:text-slate-100">
+              Advanced pricing
+              <ChevronDown className="h-4 w-4 text-slate-400 transition-transform group-open:rotate-180" />
+            </summary>
 
-          <div className="space-y-5">
-            <ProtocolPanel
-              step="Step 3"
-              title="Unit Transform"
-              icon={<Ruler className="h-4 w-4" />}
-            >
+            <div className="mt-4 grid gap-4 lg:grid-cols-2">
               <div className="space-y-4">
-                <FieldLabel>Conversion Factor</FieldLabel>
-                <Select value={unitMode} onChange={(event) => setUnitMode(event.target.value as UnitMode)}>
-                  <option value="none">No unit conversion</option>
-                  <option value="ounce-to-gram">Troy Ounce to Gram (31.1035)</option>
-                  <option value="custom">Custom factor</option>
-                </Select>
+                <div className="grid gap-4 md:grid-cols-2">
+                  <div className="space-y-2">
+                    <FieldLabel>Quote Currency</FieldLabel>
+                    <Select value={fromCurrency} onChange={(event) => setFromCurrency(event.target.value as SupportedCurrency)}>
+                      <option value="USD">USD</option>
+                      <option value="CAD">CAD</option>
+                      <option value="INR">INR</option>
+                    </Select>
+                  </div>
+                  <div className="space-y-2">
+                    <FieldLabel>Save Price In</FieldLabel>
+                    <Select value={toCurrency} onChange={(event) => setToCurrency(event.target.value as SupportedCurrency)}>
+                      <option value="USD">USD</option>
+                      <option value="CAD">CAD</option>
+                      <option value="INR">INR</option>
+                    </Select>
+                  </div>
+                </div>
+
+                <div className="grid gap-4 md:grid-cols-2">
+                  <div className="space-y-2">
+                    <FieldLabel>Unit Conversion</FieldLabel>
+                    <Select value={unitMode} onChange={(event) => setUnitMode(event.target.value as UnitMode)}>
+                      <option value="none">No unit conversion</option>
+                      <option value="ounce-to-gram">Troy ounce to gram</option>
+                      <option value="custom">Custom factor</option>
+                    </Select>
+                  </div>
+                  <div className="space-y-2">
+                    <FieldLabel>Calculation Mode</FieldLabel>
+                    <Select value={calculationMode} onChange={(event) => setCalculationMode(event.target.value as CalculationMode)}>
+                      <option value="guided">Guided</option>
+                      <option value="formula">Formula</option>
+                    </Select>
+                  </div>
+                </div>
 
                 {unitMode === 'custom' ? (
                   <div className="space-y-2">
-                    <FieldLabel>Custom factor</FieldLabel>
+                    <FieldLabel>Custom Unit Factor</FieldLabel>
                     <Input
                       type="number"
                       step="any"
@@ -282,151 +372,67 @@ export function TickerRepairModal({ asset, open, onOpenChange }: TickerRepairMod
                       onChange={(event) => setCustomUnitFactor(event.target.value)}
                       placeholder="e.g. 50"
                     />
-                    <p className="text-xs text-slate-500">
-                      This value becomes <code>{'{unit}'}</code> in formula mode, and guided mode divides the fetched quote by it.
-                    </p>
                   </div>
                 ) : null}
+              </div>
 
-                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
-                  {unitMode === 'ounce-to-gram'
-                    ? `Using 1 Troy Ounce = ${OUNCE_TO_GRAM_FACTOR} Grams.`
-                    : unitMode === 'custom'
-                      ? `Using custom factor ${formatDecimal(unitFactor, 4)}.`
-                      : 'No unit transform is being applied.'}
-                </div>
-              </div>
-            </ProtocolPanel>
-
-            <div className="rounded-[30px] border border-emerald-200 bg-[linear-gradient(135deg,_rgba(111,190,164,0.96),_rgba(122,202,166,0.82))] p-6 text-[#083c31] shadow-[0_24px_60px_rgba(79,172,142,0.28)]">
-              <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.3em]">
-                <Sigma className="h-4 w-4" />
-                Live Calculation
-              </div>
-              <div className="mt-5">
-                <div className="text-2xl font-bold tracking-tight text-slate-950">{asset.name}</div>
-                <div className="mt-1 text-sm text-[#0e5c49]">
-                  {(result?.normalizedTicker || ticker || asset.ticker || asset.name)} adjusted for {toCurrency}/{unitMode === 'ounce-to-gram' ? 'gram' : 'unit'}
-                </div>
-              </div>
-              <div className="mt-8 grid gap-6 md:grid-cols-[minmax(0,1fr)_auto] md:items-end">
-                <div>
-                  <div className="text-xs font-semibold uppercase tracking-[0.24em] text-[#0e5c49]">Calculated Price</div>
-                  <div className="mt-2 text-4xl font-black tracking-tight text-[#083c31]">
-                    {finalConvertedPrice != null ? `${currencySymbol(toCurrency)}${formatDecimal(finalConvertedPrice)}` : '--'}
+              <div className="space-y-4">
+                {calculationMode === 'formula' ? (
+                  <div className="space-y-2">
+                    <FieldLabel>Formula</FieldLabel>
+                    <Input
+                      value={priceFormula}
+                      onChange={(event) => setPriceFormula(event.target.value)}
+                      placeholder="({price} / {unit}) * {fx}"
+                    />
+                    <p className="text-xs leading-5 text-slate-500 dark:text-slate-400">
+                      Available values: <code>{'{price}'}</code>, <code>{'{unit}'}</code>, and <code>{'{fx}'}</code>.
+                    </p>
+                    {formulaResult?.error ? (
+                      <div className="rounded-xl bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:bg-amber-950/30 dark:text-amber-200">
+                        {formulaResult.error}
+                      </div>
+                    ) : null}
                   </div>
-                </div>
-                <div className="text-right">
-                  <div className="text-xs font-semibold uppercase tracking-[0.24em] text-[#0e5c49]">Per Unit</div>
-                  <div className="mt-2 text-lg font-semibold text-[#083c31]">{finalUnitLabel.replace('per ', '')}</div>
-                </div>
-              </div>
-              <div className="mt-6 rounded-2xl bg-white/45 p-4 text-sm leading-relaxed text-[#0b4b3c]">
-                {liveMath || 'Run a ticker check to see the full calculation.'}
-              </div>
-              <div className="mt-4 text-sm text-[#0b4b3c]">
-                Current total preview: <span className="font-semibold">{finalConvertedPrice != null ? `${currencySymbol(toCurrency)}${formatDecimal(finalConvertedPrice * asset.quantity)}` : '--'}</span>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div className="rounded-[28px] border border-slate-200 bg-slate-50 p-5">
-          <div className="grid gap-4 lg:grid-cols-[240px_minmax(0,1fr)] lg:items-start">
-            <div className="space-y-2">
-              <FieldLabel>Calculation Mode</FieldLabel>
-              <Select value={calculationMode} onChange={(event) => setCalculationMode(event.target.value as CalculationMode)}>
-                <option value="guided">Guided conversion</option>
-                <option value="formula">Formula</option>
-              </Select>
-            </div>
-            <div className="space-y-2">
-              {calculationMode === 'formula' ? (
-                <>
-                  <FieldLabel>Formula Editor</FieldLabel>
-                  <Input
-                    value={priceFormula}
-                    onChange={(event) => setPriceFormula(event.target.value)}
-                    placeholder="({price} / {unit}) * {fx}"
-                  />
-                  <p className="text-xs text-slate-500">
-                    Use <code>{'{price}'}</code> for the raw quote, <code>{'{unit}'}</code> for the unit factor, and <code>{'{fx}'}</code> for the live FX rate. Example: <code>1.2*{'{price}'}/2</code>
-                  </p>
-                  {formulaResult?.resolvedExpression ? (
-                    <div className="rounded-2xl border border-slate-200 bg-white p-4 text-sm text-slate-600">
-                      <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">Resolved Formula</div>
-                      <div className="mt-2 break-all font-mono text-slate-900">{formulaResult.resolvedExpression}</div>
-                      {formulaResult.error ? <div className="mt-2 text-amber-700">{formulaResult.error}</div> : null}
-                    </div>
-                  ) : null}
-                </>
-              ) : (
-                <>
-                  <FieldLabel>Guided Conversion Logic</FieldLabel>
-                  <div className="rounded-2xl border border-slate-200 bg-white p-4 text-sm text-slate-600">
-                    The modal calculates <code>(price / unit) * fx</code> using the verified provider quote, unit transform, and live FX rate.
+                ) : (
+                  <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300">
+                    Guided mode calculates <code>(price / unit) * fx</code> using the quote you just checked.
                   </div>
-                </>
-              )}
+                )}
+              </div>
             </div>
-          </div>
+          </details>
         </div>
+      </div>
 
-        <div className="sticky bottom-0 flex items-center justify-between gap-4 rounded-t-[28px] border-t border-slate-200 bg-white/95 px-1 py-4 backdrop-blur">
-          <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-400">
-            The precision editorial • clinical curator
-          </div>
-          <div className="flex items-center gap-3">
-            <Button type="button" variant="outline" onClick={() => onOpenChange(false)} className="rounded-2xl px-6">
-              Cancel
-            </Button>
-            <Button
-              type="button"
-              className="rounded-2xl bg-[#0aa06d] px-6 text-white hover:bg-[#089764]"
-              onClick={() => void saveTicker()}
-              disabled={!ticker.trim() || !canApply}
-            >
-              Save Ticker
-            </Button>
-          </div>
+      <div className="flex items-center justify-between gap-3 border-t border-slate-200 pt-3 dark:border-slate-800">
+        <p className="text-sm text-slate-500 dark:text-slate-400">
+          Keep advanced pricing collapsed unless this asset needs conversion or a custom formula.
+        </p>
+        <div className="flex items-center gap-3">
+          <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
+            Cancel
+          </Button>
+          <Button type="button" onClick={() => void saveTicker()} disabled={!canSave || isSaving}>
+            {isSaving ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+            Save
+          </Button>
         </div>
       </div>
     </Dialog>
   );
 }
 
-function ProtocolPanel({
-  step,
-  title,
-  icon,
-  children,
-}: {
-  step: string;
-  title: string;
-  icon: React.ReactNode;
-  children: React.ReactNode;
-}) {
-  return (
-    <section className="rounded-[28px] border border-slate-200/80 bg-white p-6 shadow-[0_20px_60px_rgba(15,23,42,0.06)]">
-      <div className="mb-5 flex items-center justify-between gap-3">
-        <div>
-          <div className="text-xs font-semibold uppercase tracking-[0.3em] text-[#0b6a53]">{step}</div>
-          <div className="mt-2 text-sm font-semibold uppercase tracking-[0.24em] text-slate-900">{title}</div>
-        </div>
-        <div className="text-slate-300">{icon}</div>
-      </div>
-      {children}
-    </section>
-  );
-}
-
 function FieldLabel({ children }: React.PropsWithChildren) {
-  return <label className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-900">{children}</label>;
+  return <label className="text-sm font-medium text-slate-900 dark:text-slate-100">{children}</label>;
 }
 
-function labelForProvider(provider: PriceProvider) {
+function labelForProvider(provider: ResolvedPriceProvider) {
   if (provider === 'alphavantage') return 'Alpha Vantage';
   if (provider === 'finnhub') return 'Finnhub';
+  if (provider === 'massive') return 'Massive';
+  if (provider === 'amfi') return 'AMFI NAV';
+  if (provider === 'gold') return 'Gold API';
   return 'Yahoo Finance';
 }
 
@@ -453,8 +459,8 @@ function getFxConversionFactor(
 
   const fromRate = fromCurrency === 'USD' ? 1 : rates[fromCurrency];
   const toRate = toCurrency === 'USD' ? 1 : rates[toCurrency];
-
   if (!fromRate || !toRate) return 1;
+
   return toRate / fromRate;
 }
 
@@ -494,7 +500,6 @@ function buildLiveMath({
   if (fxFactor !== 1) {
     steps.push(`* ${formatDecimal(fxFactor, 4)}`);
   }
-
   return `${steps.join(' ')} = ${currencySymbol(toCurrency)}${formatDecimal(finalPrice)}`;
 }
 

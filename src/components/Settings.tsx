@@ -13,8 +13,28 @@ import { AssetClassLogo } from '../lib/assetClassBranding';
 import { SYSTEM_ASSET_CLASSES } from '../lib/systemAssetClasses';
 import { Input } from './ui/input';
 import { Select } from './ui/select';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './ui/table';
+import { DEFAULT_BROKER_CONNECTIONS, DEFAULT_USER_PROVIDER_OVERRIDES, type BrokerConnectionConfig, type UserBrokerConnections, type UserProviderOverrides } from '../store/userPreferences';
 
 export type SettingsSection = 'manage-members' | 'price-providers' | 'asset-classes-overview' | 'price-updates' | 'data-management' | 'cloud-sync';
+type SettingsTab = 'access' | 'pricing' | 'structure' | 'data';
+
+function getTabForSection(section?: SettingsSection): SettingsTab {
+  switch (section) {
+    case 'manage-members':
+      return 'access';
+    case 'price-providers':
+    case 'price-updates':
+      return 'pricing';
+    case 'asset-classes-overview':
+      return 'structure';
+    case 'data-management':
+    case 'cloud-sync':
+      return 'data';
+    default:
+      return 'pricing';
+  }
+}
 
 export function Settings({ initialSection }: { initialSection?: SettingsSection } = {}) {
   const showDeveloperMigrationTools =
@@ -33,8 +53,13 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
     isRefreshing,
     rates,
     baseCurrency,
+    sharedPriceProviderSettings,
     priceProviderSettings,
     updatePriceProviderSettings,
+    userProviderOverrides,
+    updateUserProviderOverrides,
+    userBrokerConnections,
+    updateUserBrokerConnections,
     members,
     inviteMember,
     removeMember,
@@ -49,7 +74,9 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
   const [alertDialog, setAlertDialog] = React.useState<{ open: boolean, title: string, description: string }>({ open: false, title: '', description: '' });
   const [isAssetClassModalOpen, setIsAssetClassModalOpen] = React.useState(false);
   const [classToEdit, setClassToEdit] = React.useState<AssetClassDef | null>(null);
-  const [providerForm, setProviderForm] = React.useState<PriceProviderSettings>(DEFAULT_PRICE_PROVIDER_SETTINGS);
+  const [sharedProviderForm, setSharedProviderForm] = React.useState<PriceProviderSettings>(DEFAULT_PRICE_PROVIDER_SETTINGS);
+  const [overrideForm, setOverrideForm] = React.useState<UserProviderOverrides>(DEFAULT_USER_PROVIDER_OVERRIDES);
+  const [brokerForm, setBrokerForm] = React.useState<UserBrokerConnections>(DEFAULT_BROKER_CONNECTIONS);
   const [inviteEmail, setInviteEmail] = React.useState('');
   const [inviteRole, setInviteRole] = React.useState<'owner' | 'partner'>('partner');
   const [migrationPreview, setMigrationPreview] = React.useState<{
@@ -68,10 +95,30 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
   const [replaceConfirmText, setReplaceConfirmText] = React.useState('');
   const [isReplacingCloud, setIsReplacingCloud] = React.useState(false);
   const [migrationSource, setMigrationSource] = React.useState<'screen' | 'local'>('screen');
+  const [activeTab, setActiveTab] = React.useState<SettingsTab>(() => getTabForSection(initialSection));
+  const [personalPricingMode, setPersonalPricingMode] = React.useState<'system' | 'override'>('system');
+  const [brokerPricingMode, setBrokerPricingMode] = React.useState<'system' | 'override'>('system');
+  const [showAdvancedProviderRouting, setShowAdvancedProviderRouting] = React.useState(false);
 
   React.useEffect(() => {
-    setProviderForm(priceProviderSettings);
-  }, [priceProviderSettings]);
+    setSharedProviderForm(sharedPriceProviderSettings);
+  }, [sharedPriceProviderSettings]);
+
+  React.useEffect(() => {
+    setOverrideForm(userProviderOverrides);
+  }, [userProviderOverrides]);
+
+  React.useEffect(() => {
+    setBrokerForm(userBrokerConnections);
+  }, [userBrokerConnections]);
+
+  React.useEffect(() => {
+    setPersonalPricingMode(userProviderOverrides.enabled ? 'override' : 'system');
+  }, [userProviderOverrides.enabled]);
+
+  React.useEffect(() => {
+    setBrokerPricingMode((userBrokerConnections.upstox.enabled || userBrokerConnections.groww.enabled) ? 'override' : 'system');
+  }, [userBrokerConnections]);
 
   React.useEffect(() => {
     void loadMigrationPreview();
@@ -79,10 +126,7 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
 
   React.useEffect(() => {
     if (!initialSection) return;
-    const frame = window.requestAnimationFrame(() => {
-      document.getElementById(initialSection)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    });
-    return () => window.cancelAnimationFrame(frame);
+    setActiveTab(getTabForSection(initialSection));
   }, [initialSection]);
 
   const downloadIndiaTemplate = () => {
@@ -546,9 +590,33 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
     });
   }
 
-  const saveProviderPreferences = async () => {
-    await updatePriceProviderSettings(providerForm);
-    setAlertDialog({ open: true, title: 'Saved', description: 'Price provider settings have been updated.' });
+  const saveSharedProviderPreferences = async () => {
+    await updatePriceProviderSettings(sharedProviderForm);
+    setAlertDialog({ open: true, title: 'Saved', description: 'Shared provider defaults have been updated.' });
+  };
+
+  const savePersonalProviderOverrides = async () => {
+    await updateUserProviderOverrides({ ...overrideForm, enabled: true });
+    setAlertDialog({ open: true, title: 'Saved', description: 'Your personal provider overrides are stored on this device.' });
+  };
+
+  const saveSystemProvidedPricing = async () => {
+    await updateUserProviderOverrides({ ...overrideForm, enabled: false });
+    setAlertDialog({ open: true, title: 'Using System Pricing', description: 'This device will use the shared app pricing setup.' });
+  };
+
+  const saveBrokerConnections = async () => {
+    await updateUserBrokerConnections(brokerForm);
+    setAlertDialog({ open: true, title: 'Saved', description: 'Broker connection details are stored on this device.' });
+  };
+
+  const saveSystemBrokerRouting = async () => {
+    await updateUserBrokerConnections({
+      ...brokerForm,
+      upstox: { ...brokerForm.upstox, enabled: false },
+      groww: { ...brokerForm.groww, enabled: false },
+    });
+    setAlertDialog({ open: true, title: 'Using System Routing', description: 'This device will keep using the shared/default India stock routing.' });
   };
 
   const handleInvite = async () => {
@@ -595,7 +663,7 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
     const sourceAssetClasses = migrationSource === 'screen' ? assetClasses : migrationPreview.localClasses;
     const sourceBaseCurrency = migrationSource === 'screen' ? baseCurrency : migrationPreview.localBaseCurrency || undefined;
     const sourcePriceProviderSettings = migrationSource === 'screen'
-      ? priceProviderSettings
+      ? sharedPriceProviderSettings
       : migrationPreview.localPriceProviderSettings || undefined;
     try {
       await replaceCloudPortfolio({
@@ -622,33 +690,91 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
     }
   };
 
+  const updateBrokerConfig = (
+    broker: keyof UserBrokerConnections,
+    field: keyof BrokerConnectionConfig,
+    value: string | boolean,
+  ) => {
+    setBrokerForm((current) => ({
+      ...current,
+      [broker]: {
+        ...current[broker],
+        [field]: value,
+      },
+    }));
+  };
+
+  const providerOptions: Array<{ value: PriceProvider; label: string }> = [
+    { value: 'yahoo', label: 'Yahoo Finance' },
+    { value: 'alphavantage', label: 'Alpha Vantage' },
+    { value: 'finnhub', label: 'Finnhub' },
+  ];
+
+  const tabItems: Array<{ id: SettingsTab; label: string; description: string }> = [
+    { id: 'access', label: 'Access', description: 'Members and roles' },
+    { id: 'pricing', label: 'Pricing', description: 'Providers and brokers' },
+    { id: 'structure', label: 'Structure', description: 'Classes and organization' },
+    { id: 'data', label: 'Data', description: 'Imports, sync, migration' },
+  ];
+
   return (
     <div className="space-y-6 max-w-5xl mx-auto pb-12">
-      <div className="flex justify-between items-center mb-8">
-        <div>
+      <div className="mb-8 space-y-5">
+        <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
+          <div>
           <h1 className="text-4xl font-extrabold tracking-tight text-slate-900 dark:text-white mb-2">Settings</h1>
-          <p className="text-lg text-slate-500 dark:text-slate-400">Configure your portfolio tracker</p>
+            <p className="text-lg text-slate-500 dark:text-slate-400">Configure your portfolio tracker without digging through one long page.</p>
+          </div>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm dark:border-slate-800 dark:bg-slate-950">
+              <div className="text-slate-500 dark:text-slate-400">Members</div>
+              <div className="mt-1 text-xl font-semibold text-slate-900 dark:text-white">{members.length}</div>
+            </div>
+            <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm dark:border-slate-800 dark:bg-slate-950">
+              <div className="text-slate-500 dark:text-slate-400">Assets</div>
+              <div className="mt-1 text-xl font-semibold text-slate-900 dark:text-white">{assets.length}</div>
+            </div>
+            <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm dark:border-slate-800 dark:bg-slate-950">
+              <div className="text-slate-500 dark:text-slate-400">Classes</div>
+              <div className="mt-1 text-xl font-semibold text-slate-900 dark:text-white">{allAssetClasses.length}</div>
+            </div>
+            <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm dark:border-slate-800 dark:bg-slate-950">
+              <div className="text-slate-500 dark:text-slate-400">Base Currency</div>
+              <div className="mt-1 text-xl font-semibold text-slate-900 dark:text-white">{baseCurrency}</div>
+            </div>
+          </div>
         </div>
-        <div className="flex gap-3">
-          <Button
-            variant="outline"
-            className="rounded-full px-6"
-            onClick={() => document.getElementById('manage-members')?.scrollIntoView({ behavior: 'smooth' })}
-          >
-            <Users className="mr-2 h-4 w-4" />
-            Manage Members
-          </Button>
-          <Button 
-            className="bg-[#00875A] hover:bg-[#007A51] text-white rounded-full px-6"
-            onClick={() => document.getElementById('data-management')?.scrollIntoView({ behavior: 'smooth' })}
-          >
-            <Upload className="h-4 w-4 mr-2" />
-            Import Assets
-          </Button>
+
+        <div className="rounded-3xl border border-slate-200 bg-slate-50 p-2 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+          <div className="grid gap-2 md:grid-cols-4">
+            {tabItems.map((tab) => {
+              const isActive = activeTab === tab.id;
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => setActiveTab(tab.id)}
+                  aria-pressed={isActive}
+                  className={`relative overflow-hidden rounded-2xl border px-4 py-3 text-left transition-all ${
+                    isActive
+                      ? 'border-emerald-200 bg-white text-slate-950 shadow-md ring-1 ring-emerald-100 dark:border-emerald-800 dark:bg-slate-950 dark:text-white dark:ring-emerald-900/60'
+                      : 'border-transparent text-slate-600 hover:border-slate-200 hover:bg-white/80 hover:text-slate-900 dark:text-slate-300 dark:hover:border-slate-700 dark:hover:bg-slate-950/60 dark:hover:text-white'
+                  }`}
+                >
+                  {isActive && (
+                    <span className="absolute inset-y-3 left-0 w-1 rounded-r-full bg-emerald-500 dark:bg-emerald-400" />
+                  )}
+                  <div className={`text-sm font-semibold ${isActive ? 'text-slate-950 dark:text-white' : ''}`}>{tab.label}</div>
+                  <div className={`mt-1 text-xs ${isActive ? 'text-slate-600 dark:text-slate-300' : 'text-slate-500 dark:text-slate-400'}`}>{tab.description}</div>
+                </button>
+              );
+            })}
+          </div>
         </div>
       </div>
 
-      {/* Family Members Card */}
+      {activeTab === 'access' && (
+        <>
       <Card id="manage-members" className="border-none shadow-sm rounded-2xl mb-6">
         <CardHeader>
           <div className="flex items-center gap-2">
@@ -739,70 +865,328 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
           </div>
         </CardContent>
       </Card>
+        </>
+      )}
 
+      {activeTab === 'pricing' && (
+        <>
       <Card id="price-providers" className="border-none shadow-sm rounded-2xl mb-6">
         <CardHeader>
           <div className="flex items-center gap-2">
             <TrendingUp className="h-5 w-5 text-slate-700 dark:text-slate-300" />
             <CardTitle>Price Provider Settings</CardTitle>
           </div>
-          <CardDescription>Set API keys and choose which provider to try first when fetching live prices.</CardDescription>
+          <CardDescription>Set up each asset type in one pass. For every route, users can stay on the system setup or override with their own credentials on this device.</CardDescription>
         </CardHeader>
-        <CardContent className="space-y-5">
-          <div className="grid gap-4 md:grid-cols-2">
-            <div className="space-y-2">
-              <label className="text-sm font-medium">Alpha Vantage API Key</label>
-              <Input
-                value={providerForm.alphaVantageApiKey}
-                onChange={(event) => setProviderForm((prev) => ({ ...prev, alphaVantageApiKey: event.target.value.trim() }))}
-                placeholder="Enter Alpha Vantage key"
-              />
-            </div>
-            <div className="space-y-2">
-              <label className="text-sm font-medium">Finnhub API Key</label>
-              <Input
-                value={providerForm.finnhubApiKey}
-                onChange={(event) => setProviderForm((prev) => ({ ...prev, finnhubApiKey: event.target.value.trim() }))}
-                placeholder="Enter Finnhub key"
-              />
-            </div>
+        <CardContent className="space-y-4">
+          <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-950">
+            <Table className="[&_td]:py-3 [&_th]:py-3">
+              <TableHeader>
+                <TableRow className="hover:bg-transparent">
+                  <TableHead className="pl-5">Asset Type</TableHead>
+                  <TableHead>System Source</TableHead>
+                  <TableHead className="w-[240px]">Choice</TableHead>
+                  <TableHead>Meaning</TableHead>
+                  <TableHead className="pr-5 text-right">State</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                <TableRow>
+                  <TableCell className="pl-5">
+                    <div className="font-semibold text-slate-900 dark:text-white">U.S. & Canada Stocks / ETFs</div>
+                    <div className="text-xs text-slate-500 dark:text-slate-400">Market-data powered prices</div>
+                  </TableCell>
+                  <TableCell className="text-slate-700 dark:text-slate-300">Shared market-data route</TableCell>
+                  <TableCell>
+                    <Select
+                      value={personalPricingMode}
+                      onChange={(event) => setPersonalPricingMode(event.target.value as 'system' | 'override')}
+                      className="min-w-[220px]"
+                    >
+                      <option value="system">System provided API</option>
+                      <option value="override">Override with my credentials</option>
+                    </Select>
+                  </TableCell>
+                  <TableCell className="text-slate-600 dark:text-slate-300">
+                    {personalPricingMode === 'override'
+                      ? 'Use a personal data key on this device only.'
+                      : 'Use the shared route and shared quota.'}
+                  </TableCell>
+                  <TableCell className="pr-5 text-right">
+                    <span className={`inline-flex rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-wide ${
+                      personalPricingMode === 'override'
+                        ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:text-amber-200'
+                        : 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-200'
+                    }`}>
+                      {personalPricingMode === 'override' ? 'Needs config' : 'System'}
+                    </span>
+                  </TableCell>
+                </TableRow>
+                <TableRow>
+                  <TableCell className="pl-5">
+                    <div className="font-semibold text-slate-900 dark:text-white">India Mutual Funds</div>
+                    <div className="text-xs text-slate-500 dark:text-slate-400">No manual setup</div>
+                  </TableCell>
+                  <TableCell className="text-slate-700 dark:text-slate-300">AMFI public feed</TableCell>
+                  <TableCell>No override needed</TableCell>
+                  <TableCell className="text-slate-600 dark:text-slate-300">Handled automatically without user credentials.</TableCell>
+                  <TableCell className="pr-5 text-right">
+                    <span className="inline-flex rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                      Ready
+                    </span>
+                  </TableCell>
+                </TableRow>
+                <TableRow>
+                  <TableCell className="pl-5">
+                    <div className="font-semibold text-slate-900 dark:text-white">India Stocks</div>
+                    <div className="text-xs text-slate-500 dark:text-slate-400">Broker-backed option</div>
+                  </TableCell>
+                  <TableCell className="text-slate-700 dark:text-slate-300">Shared/default India route</TableCell>
+                  <TableCell>
+                    <Select
+                      value={brokerPricingMode}
+                      onChange={(event) => setBrokerPricingMode(event.target.value as 'system' | 'override')}
+                      className="min-w-[220px]"
+                    >
+                      <option value="system">System provided route</option>
+                      <option value="override">Override with my credentials</option>
+                    </Select>
+                  </TableCell>
+                  <TableCell className="text-slate-600 dark:text-slate-300">
+                    {brokerPricingMode === 'override'
+                      ? 'Use broker credentials saved on this device.'
+                      : 'Use the shared/default India stock route.'}
+                  </TableCell>
+                  <TableCell className="pr-5 text-right">
+                    <span className={`inline-flex rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-wide ${
+                      brokerPricingMode === 'override'
+                        ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:text-amber-200'
+                        : 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-200'
+                    }`}>
+                      {brokerPricingMode === 'override' ? 'Needs config' : 'System'}
+                    </span>
+                  </TableCell>
+                </TableRow>
+              </TableBody>
+            </Table>
           </div>
-          <div className="grid gap-4 md:grid-cols-2">
-            <div className="space-y-2">
-              <label className="text-sm font-medium">Primary Provider</label>
-              <Select
-                value={providerForm.primaryProvider}
-                onChange={(event) => setProviderForm((prev) => ({ ...prev, primaryProvider: event.target.value as PriceProvider }))}
-              >
-                <option value="yahoo">Yahoo Finance</option>
-                <option value="alphavantage">Alpha Vantage</option>
-                <option value="finnhub">Finnhub</option>
-              </Select>
+
+          {personalPricingMode === 'override' && (
+            <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-950">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-sm font-semibold text-slate-900 dark:text-white">Stocks & ETFs Override Credentials</h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">Private to this device. Other users keep using the shared setup.</p>
+                </div>
+              </div>
+              <div className="grid gap-4 md:grid-cols-2">
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Alpha Vantage API Key</label>
+                  <Input
+                    type="password"
+                    value={overrideForm.alphaVantageApiKey}
+                    onChange={(event) => setOverrideForm((prev) => ({ ...prev, alphaVantageApiKey: event.target.value.trim() }))}
+                    placeholder="Enter your Alpha Vantage key"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Finnhub API Key</label>
+                  <Input
+                    type="password"
+                    value={overrideForm.finnhubApiKey}
+                    onChange={(event) => setOverrideForm((prev) => ({ ...prev, finnhubApiKey: event.target.value.trim() }))}
+                    placeholder="Enter your Finnhub key"
+                  />
+                </div>
+              </div>
+              <div className="mt-4 grid gap-4 md:grid-cols-2">
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Primary Override</label>
+                  <Select
+                    value={overrideForm.primaryProviderOverride}
+                    onChange={(event) => setOverrideForm((prev) => ({ ...prev, primaryProviderOverride: event.target.value as UserProviderOverrides['primaryProviderOverride'] }))}
+                  >
+                    <option value="app-default">Use app default</option>
+                    {providerOptions.map((option) => (
+                      <option key={option.value} value={option.value}>{option.label}</option>
+                    ))}
+                  </Select>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Secondary Override</label>
+                  <Select
+                    value={overrideForm.secondaryProviderOverride}
+                    onChange={(event) => setOverrideForm((prev) => ({ ...prev, secondaryProviderOverride: event.target.value as UserProviderOverrides['secondaryProviderOverride'] }))}
+                  >
+                    <option value="app-default">Use app default</option>
+                    {providerOptions.map((option) => (
+                      <option key={option.value} value={option.value}>{option.label}</option>
+                    ))}
+                  </Select>
+                </div>
+              </div>
+              <div className="mt-4 flex justify-end">
+                <Button className="rounded-full bg-[#00875A] text-white hover:bg-[#007A51]" onClick={savePersonalProviderOverrides}>
+                  Save Personal Credentials
+                </Button>
+              </div>
             </div>
-            <div className="space-y-2">
-              <label className="text-sm font-medium">Secondary Provider</label>
-              <Select
-                value={providerForm.secondaryProvider}
-                onChange={(event) => setProviderForm((prev) => ({ ...prev, secondaryProvider: event.target.value as PriceProvider }))}
-              >
-                <option value="yahoo">Yahoo Finance</option>
-                <option value="alphavantage">Alpha Vantage</option>
-                <option value="finnhub">Finnhub</option>
-              </Select>
+          )}
+
+          {brokerPricingMode === 'override' && (
+            <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-950">
+              <div className="mb-3">
+                <h3 className="text-sm font-semibold text-slate-900 dark:text-white">India Stocks Override Credentials</h3>
+                <p className="text-xs text-slate-500 dark:text-slate-400">Private to this device. Pick whichever broker this user wants to rely on.</p>
+              </div>
+              <div className="grid gap-4 lg:grid-cols-2">
+                {([
+                  ['upstox', 'Upstox', 'Good fit for India stock pricing and instrument matching.'],
+                  ['groww', 'Groww', 'Useful if this user wants to rely on their Groww account instead.'],
+                ] as const).map(([brokerKey, brokerLabel, brokerDescription]) => (
+                  <div key={brokerKey} className="rounded-xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900">
+                    <div className="mb-3 flex items-start justify-between gap-4">
+                      <div>
+                        <div className="text-sm font-semibold text-slate-900 dark:text-white">{brokerLabel}</div>
+                        <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">{brokerDescription}</p>
+                      </div>
+                      <label className="flex items-center gap-2 text-sm font-medium text-slate-700 dark:text-slate-200">
+                        <input
+                          type="checkbox"
+                          checked={brokerForm[brokerKey].enabled}
+                          onChange={(event) => updateBrokerConfig(brokerKey, 'enabled', event.target.checked)}
+                          className="h-4 w-4 rounded border-slate-300 text-[#00875A] focus:ring-[#00875A]"
+                        />
+                        Use
+                      </label>
+                    </div>
+                    <div className="grid gap-3">
+                      <Input
+                        value={brokerForm[brokerKey].accountLabel}
+                        onChange={(event) => updateBrokerConfig(brokerKey, 'accountLabel', event.target.value)}
+                        placeholder={`${brokerLabel} account label`}
+                        disabled={!brokerForm[brokerKey].enabled}
+                      />
+                      <Input
+                        value={brokerForm[brokerKey].clientId}
+                        onChange={(event) => updateBrokerConfig(brokerKey, 'clientId', event.target.value.trim())}
+                        placeholder="Client ID / API key"
+                        disabled={!brokerForm[brokerKey].enabled}
+                      />
+                      <Input
+                        type="password"
+                        value={brokerForm[brokerKey].clientSecret}
+                        onChange={(event) => updateBrokerConfig(brokerKey, 'clientSecret', event.target.value.trim())}
+                        placeholder="Client secret"
+                        disabled={!brokerForm[brokerKey].enabled}
+                      />
+                      <Input
+                        value={brokerForm[brokerKey].redirectUri}
+                        onChange={(event) => updateBrokerConfig(brokerKey, 'redirectUri', event.target.value.trim())}
+                        placeholder="Redirect URI"
+                        disabled={!brokerForm[brokerKey].enabled}
+                      />
+                      <Input
+                        type="password"
+                        value={brokerForm[brokerKey].accessToken}
+                        onChange={(event) => updateBrokerConfig(brokerKey, 'accessToken', event.target.value.trim())}
+                        placeholder="Access token"
+                        disabled={!brokerForm[brokerKey].enabled}
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-4 flex justify-end">
+                <Button className="rounded-full bg-[#00875A] text-white hover:bg-[#007A51]" onClick={saveBrokerConnections}>
+                  Save Broker Credentials
+                </Button>
+              </div>
             </div>
-          </div>
-          <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-500 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-400">
-            The app will try the primary provider first, wait 500ms, and then fall back to the secondary provider if needed. Failed rows keep their last known price and will be highlighted in the Assets table.
-          </div>
-          <div className="flex justify-end">
-            <Button className="rounded-full bg-[#00875A] text-white hover:bg-[#007A51]" onClick={saveProviderPreferences}>
-              Save Provider Settings
-            </Button>
+          )}
+
+          <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-950">
+            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+              <div>
+                <h3 className="text-sm font-semibold text-slate-900 dark:text-white">Advanced fallback order</h3>
+                <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                  Most users do not need this. Auto-routing already picks the right source for the asset type.
+                </p>
+              </div>
+                <div className="flex items-center gap-3">
+                  <div className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold uppercase tracking-wider text-slate-600 dark:bg-slate-900 dark:text-slate-300">
+                    {sharedProviderForm.primaryProvider}{' -> '}{sharedProviderForm.secondaryProvider}
+                  </div>
+                <Button variant="outline" className="rounded-full" onClick={() => setShowAdvancedProviderRouting((current) => !current)}>
+                  {showAdvancedProviderRouting ? 'Hide advanced routing' : 'Edit advanced routing'}
+                </Button>
+              </div>
+            </div>
+
+            {showAdvancedProviderRouting && (
+              <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900">
+                <div className="grid gap-4 md:grid-cols-2">
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">Primary Fallback</label>
+                    <Select
+                      value={sharedProviderForm.primaryProvider}
+                      onChange={(event) => setSharedProviderForm((prev) => ({ ...prev, primaryProvider: event.target.value as PriceProvider }))}
+                    >
+                      {providerOptions.map((option) => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </Select>
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">Secondary Fallback</label>
+                    <Select
+                      value={sharedProviderForm.secondaryProvider}
+                      onChange={(event) => setSharedProviderForm((prev) => ({ ...prev, secondaryProvider: event.target.value as PriceProvider }))}
+                    >
+                      {providerOptions.map((option) => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </Select>
+                  </div>
+                </div>
+                <p className="mt-3 text-xs text-slate-500 dark:text-slate-400">
+                  This only affects shared/system routes that still need a fallback chain. It does not override asset-type auto-routing like AMFI for India mutual funds or Upstox for India stocks.
+                </p>
+                <div className="mt-4 flex justify-end">
+                  <Button className="rounded-full bg-[#00875A] text-white hover:bg-[#007A51]" onClick={saveSharedProviderPreferences}>
+                    Save Advanced Routing
+                  </Button>
+                </div>
+              </div>
+            )}
           </div>
         </CardContent>
       </Card>
+      
+      <Card id="price-updates" className="border-none shadow-sm rounded-2xl mb-12">
+        <CardHeader className="flex flex-row items-center justify-between">
+          <div>
+            <div className="flex items-center gap-2">
+              <TrendingUp className="h-5 w-5 text-slate-700 dark:text-slate-300" />
+              <CardTitle>Price Updates</CardTitle>
+            </div>
+            <CardDescription>Refresh live prices using your configured provider fallback order.</CardDescription>
+          </div>
+          <Button variant="outline" onClick={refreshPrices} disabled={isRefreshing} className="rounded-full">
+            <RefreshCw className={`h-4 w-4 mr-2 ${isRefreshing ? 'animate-spin' : ''}`} />
+            Refresh All Prices
+          </Button>
+        </CardHeader>
+        <CardContent>
+          <p className="text-sm text-slate-500 mb-1">Assets with valid tickers will have their prices updated automatically.</p>
+          <p className="text-sm text-slate-500">Ticker format: use `EXCHANGE:TICKER` where needed (e.g., `NASDAQ:AAPL`, `NSE:RELIANCE`).</p>
+        </CardContent>
+      </Card>
+        </>
+      )}
 
-      {/* Asset Classes Card */}
+      {activeTab === 'structure' && (
+        <>
       <Card id="asset-classes-overview" className="border-none shadow-sm rounded-2xl mb-6">
         <CardHeader className="flex flex-row items-start justify-between">
           <div>
@@ -884,29 +1268,44 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
         </CardContent>
       </Card>
 
-      {/* Price Updates Card */}
-      <Card id="price-updates" className="border-none shadow-sm rounded-2xl mb-12">
-        <CardHeader className="flex flex-row items-center justify-between">
-          <div>
-            <div className="flex items-center gap-2">
-              <TrendingUp className="h-5 w-5 text-slate-700 dark:text-slate-300" />
-              <CardTitle>Price Updates</CardTitle>
-            </div>
-            <CardDescription>Refresh live prices using your configured provider fallback order.</CardDescription>
-          </div>
-          <Button variant="outline" onClick={refreshPrices} disabled={isRefreshing} className="rounded-full">
-            <RefreshCw className={`h-4 w-4 mr-2 ${isRefreshing ? 'animate-spin' : ''}`} />
-            Refresh All Prices
-          </Button>
+      <Card className="border-none shadow-sm rounded-2xl">
+        <CardHeader>
+          <CardTitle>Asset Class Library</CardTitle>
+          <CardDescription>Import, export, or erase custom asset class definitions.</CardDescription>
         </CardHeader>
         <CardContent>
-          <p className="text-sm text-slate-500 mb-1">Assets with valid tickers will have their prices updated automatically.</p>
-          <p className="text-sm text-slate-500">Ticker format: use `EXCHANGE:TICKER` where needed (e.g., `NASDAQ:AAPL`, `NSE:RELIANCE`).</p>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" onClick={downloadClassesTemplate}>
+              <Download className="mr-2 h-4 w-4" />
+              Download Template
+            </Button>
+            <input type="file" accept=".csv,.tsv" className="hidden" ref={classesFileRef} onChange={handleClassesUpload} />
+            <Button variant="outline" onClick={() => classesFileRef.current?.click()}>
+              <Upload className="mr-2 h-4 w-4" />
+              Import Asset Classes
+            </Button>
+            <Button variant="destructive" onClick={() => {
+              setConfirmDialog({
+                open: true,
+                title: 'Erase All Classes',
+                description: 'Are you sure you want to erase ALL custom asset classes? This cannot be undone.',
+                onConfirm: () => {
+                  clearAllAssetClasses();
+                  setConfirmDialog(prev => ({ ...prev, open: false }));
+                }
+              });
+            }}>
+              <Trash2 className="mr-2 h-4 w-4" />
+              Erase All Classes
+            </Button>
+          </div>
         </CardContent>
       </Card>
+        </>
+      )}
 
-      {/* Data Management Section */}
-      <div id="data-management" className="pt-8 border-t border-slate-200 dark:border-slate-800 space-y-6">
+      {activeTab === 'data' && (
+      <div id="data-management" className="space-y-6">
         <div className="mb-6">
           <h2 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white">Data Management & Sync</h2>
           <p className="text-slate-500 dark:text-slate-400">Manage your raw data imports, exports, and cloud synchronization.</p>
@@ -954,7 +1353,7 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
                 <div>Assets: <span className="font-semibold text-slate-900 dark:text-white">{assets.length}</span></div>
                 <div>Asset Classes: <span className="font-semibold text-slate-900 dark:text-white">{assetClasses.length}</span></div>
                 <div>Base Currency: <span className="font-semibold text-slate-900 dark:text-white">{baseCurrency}</span></div>
-                <div>Primary Provider: <span className="font-semibold text-slate-900 dark:text-white">{priceProviderSettings.primaryProvider}</span></div>
+                <div>Primary Provider: <span className="font-semibold text-slate-900 dark:text-white">{sharedPriceProviderSettings.primaryProvider}</span></div>
               </div>
             </div>
             <div className={`rounded-2xl border p-4 ${migrationSource === 'local' ? 'border-emerald-300 bg-emerald-50 dark:border-emerald-900 dark:bg-emerald-950/20' : 'border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-950'}`}>
@@ -1046,61 +1445,33 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
             </div>
           </div>
 
-          <div className="pt-4 border-t">
-            <Button variant="destructive" onClick={() => {
-              setConfirmDialog({
-                open: true,
-                title: 'Erase All Holdings',
-                description: 'Are you sure you want to erase ALL holdings? This cannot be undone.',
-                onConfirm: () => {
-                  clearAllAssets();
-                  setConfirmDialog(prev => ({ ...prev, open: false }));
-                }
-              });
-            }}>
-              <Trash2 className="mr-2 h-4 w-4" />
-              Erase All Holdings
-            </Button>
-          </div>
         </CardContent>
       </Card>
 
       <Card className="border-none shadow-sm rounded-2xl">
         <CardHeader>
-          <CardTitle>Asset Classes</CardTitle>
-          <CardDescription>Manage custom asset classes for different countries.</CardDescription>
+          <CardTitle>Danger Zone</CardTitle>
+          <CardDescription>Erase imported holdings if you need to reset the portfolio data.</CardDescription>
         </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="flex flex-wrap gap-2">
-            <Button variant="outline" onClick={downloadClassesTemplate}>
-              <Download className="mr-2 h-4 w-4" />
-              Download Template
-            </Button>
-            
-            <input type="file" accept=".csv,.tsv" className="hidden" ref={classesFileRef} onChange={handleClassesUpload} />
-            <Button variant="outline" onClick={() => classesFileRef.current?.click()}>
-              <Upload className="mr-2 h-4 w-4" />
-              Import Asset Classes
-            </Button>
-
-            <Button variant="destructive" onClick={() => {
-              setConfirmDialog({
-                open: true,
-                title: 'Erase All Classes',
-                description: 'Are you sure you want to erase ALL custom asset classes? This cannot be undone.',
-                onConfirm: () => {
-                  clearAllAssetClasses();
-                  setConfirmDialog(prev => ({ ...prev, open: false }));
-                }
-              });
-            }}>
-              <Trash2 className="mr-2 h-4 w-4" />
-              Erase All Classes
-            </Button>
-          </div>
+        <CardContent>
+          <Button variant="destructive" onClick={() => {
+            setConfirmDialog({
+              open: true,
+              title: 'Erase All Holdings',
+              description: 'Are you sure you want to erase ALL holdings? This cannot be undone.',
+              onConfirm: () => {
+                clearAllAssets();
+                setConfirmDialog(prev => ({ ...prev, open: false }));
+              }
+            });
+          }}>
+            <Trash2 className="mr-2 h-4 w-4" />
+            Erase All Holdings
+          </Button>
         </CardContent>
       </Card>
       </div>
+      )}
 
       <Dialog open={confirmDialog.open} onOpenChange={(open) => setConfirmDialog(prev => ({ ...prev, open }))}>
         <DialogHeader>

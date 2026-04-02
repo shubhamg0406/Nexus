@@ -1,11 +1,16 @@
 import express from "express";
-import { createServer as createViteServer } from "vite";
+import { createServer as createViteServer, loadEnv } from "vite";
 import path from "node:path";
-import { fetchYahooFinancePrice } from "./src/lib/financeServer";
+import { fetchAutoMatchedPrice } from "./src/lib/financeServer";
 
 async function startServer() {
+  const env = loadEnv(process.env.NODE_ENV || "development", process.cwd(), "");
+  if (env.MASSIVE_API_KEY && !process.env.MASSIVE_API_KEY) {
+    process.env.MASSIVE_API_KEY = env.MASSIVE_API_KEY;
+  }
+
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT || env.PORT || 3000);
 
   // API routes FIRST
   app.get("/api/health", (req, res) => {
@@ -19,7 +24,12 @@ async function startServer() {
     }
 
     try {
-      const result = await fetchYahooFinancePrice(ticker);
+      const result = await fetchAutoMatchedPrice({
+        ticker,
+        name: req.query.name as string | undefined,
+        assetClass: req.query.assetClass as string | undefined,
+        country: req.query.country as string | undefined,
+      });
 
       if (result.price !== null) {
         res.json({
@@ -27,7 +37,8 @@ async function startServer() {
           previousClose: result.previousClose,
           currency: result.currency,
           sourceUrl: result.sourceUrl,
-          normalizedTicker: result.yahooTicker,
+          normalizedTicker: 'provider' in result ? result.normalizedTicker : result.yahooTicker,
+          provider: 'provider' in result ? result.provider : 'yahoo',
         });
       } else {
         res.status(404).json({
@@ -35,11 +46,37 @@ async function startServer() {
           previousClose: result.previousClose,
           currency: result.currency,
           sourceUrl: result.sourceUrl,
-          normalizedTicker: result.yahooTicker,
+          normalizedTicker: 'provider' in result ? result.normalizedTicker : result.yahooTicker,
+          provider: 'provider' in result ? result.provider : 'yahoo',
         });
       }
     } catch (error) {
       console.error("Error fetching finance data from Yahoo:", error);
+      res.status(500).json({ error: "Failed to fetch data" });
+    }
+  });
+
+  app.get("/api/finance-auto", async (req, res) => {
+    const ticker = req.query.ticker as string;
+    if (!ticker) {
+      return res.status(400).json({ error: "Ticker is required" });
+    }
+
+    try {
+      const result = await fetchAutoMatchedPrice({
+        ticker,
+        name: req.query.name as string | undefined,
+        assetClass: req.query.assetClass as string | undefined,
+        country: req.query.country as string | undefined,
+      });
+
+      if (result.price !== null) {
+        res.json(result);
+      } else {
+        res.status(404).json(result);
+      }
+    } catch (error) {
+      console.error("Error fetching auto-matched finance data:", error);
       res.status(500).json({ error: "Failed to fetch data" });
     }
   });

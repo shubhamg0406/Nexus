@@ -1,4 +1,5 @@
 export type PriceProvider = 'yahoo' | 'alphavantage' | 'finnhub';
+export type ResolvedPriceProvider = PriceProvider | 'massive' | 'amfi' | 'upstox' | 'gold';
 
 export interface PriceProviderSettings {
   alphaVantageApiKey: string;
@@ -10,7 +11,7 @@ export interface PriceProviderSettings {
 export interface PriceFetchResult {
   price: number | null;
   previousClose?: number | null;
-  provider: PriceProvider;
+  provider: ResolvedPriceProvider;
   normalizedTicker?: string;
   currency?: string;
   sourceUrl?: string;
@@ -79,15 +80,58 @@ export async function fetchPriceWithFallback(ticker: string, settings: PriceProv
   return fetchPriceWithProviderOrder(ticker, [settings.primaryProvider, settings.secondaryProvider], settings);
 }
 
+export async function fetchAutoMatchedPriceForAsset(
+  asset: {
+    ticker?: string;
+    name: string;
+    assetClass: string;
+    country: string;
+    preferredPriceProvider?: PriceProvider;
+  },
+  settings: PriceProviderSettings = DEFAULT_PRICE_PROVIDER_SETTINGS,
+) {
+  const ticker = asset.ticker?.trim() || '';
+  if (!ticker) {
+    return {
+      price: null,
+      provider: asset.preferredPriceProvider || settings.primaryProvider,
+      error: 'Ticker is required.',
+    } satisfies PriceFetchResult;
+  }
+
+  if (shouldAutoMatchWithServer(asset)) {
+    const requestUrl = new URL('/api/finance', window.location.origin);
+    requestUrl.searchParams.set('ticker', ticker);
+    requestUrl.searchParams.set('name', asset.name);
+    requestUrl.searchParams.set('assetClass', asset.assetClass);
+    requestUrl.searchParams.set('country', asset.country);
+
+    const response = await fetch(requestUrl.toString());
+    const data = await safeJson(response);
+    return {
+      price: typeof data?.price === 'number' ? data.price : null,
+      previousClose: typeof data?.previousClose === 'number' ? data.previousClose : null,
+      provider: isResolvedPriceProvider(data?.provider) ? data.provider : settings.primaryProvider,
+      normalizedTicker: typeof data?.normalizedTicker === 'string' ? data.normalizedTicker : ticker,
+      currency: typeof data?.currency === 'string' ? data.currency : undefined,
+      sourceUrl: typeof data?.sourceUrl === 'string' ? data.sourceUrl : undefined,
+      error: typeof data?.error === 'string' ? data.error : undefined,
+    } satisfies PriceFetchResult;
+  }
+
+  const providerOrder = asset.preferredPriceProvider
+    ? [asset.preferredPriceProvider, settings.primaryProvider, settings.secondaryProvider]
+    : [settings.primaryProvider, settings.secondaryProvider];
+
+  return fetchPriceWithProviderOrder(ticker, providerOrder, settings);
+}
+
 export async function fetchPriceWithProviderOrder(
   ticker: string,
   providers: PriceProvider[],
   settings: PriceProviderSettings = DEFAULT_PRICE_PROVIDER_SETTINGS,
 ) {
-  const configuredProviders = providers.filter((provider) => isProviderConfigured(provider, settings));
-  const uniqueProviders = prioritizeAvailableProviders(
-    dedupeProviders(configuredProviders.length > 0 ? configuredProviders : ['yahoo']),
-  );
+  const uniqueProviders = getEffectiveProviderOrder(providers, settings);
   let lastFailure: PriceFetchResult | null = null;
 
   for (let index = 0; index < uniqueProviders.length; index += 1) {
@@ -109,11 +153,32 @@ export async function fetchPriceWithProviderOrder(
   };
 }
 
+export function getEffectiveProviderOrder(
+  providers: PriceProvider[],
+  settings: PriceProviderSettings = DEFAULT_PRICE_PROVIDER_SETTINGS,
+) {
+  const requestedProviders = dedupeProviders(providers.length > 0 ? providers : [settings.primaryProvider, settings.secondaryProvider, 'yahoo']);
+  const configuredProviders = requestedProviders.filter((provider) => isProviderConfigured(provider, settings));
+  const baseProviders = configuredProviders.length > 0 ? configuredProviders : ['yahoo'];
+
+  return prioritizeAvailableProviders(baseProviders, settings);
+}
+
 function isProviderConfigured(provider: PriceProvider, settings: PriceProviderSettings) {
   if (provider === 'yahoo') return true;
   if (provider === 'alphavantage') return Boolean(settings.alphaVantageApiKey?.trim());
   if (provider === 'finnhub') return Boolean(settings.finnhubApiKey?.trim());
   return false;
+}
+
+function shouldAutoMatchWithServer(asset: { ticker?: string; assetClass: string; country: string }) {
+  const ticker = asset.ticker?.trim() || '';
+  return (
+    isIndianMutualFundAsset(asset.assetClass, asset.country, ticker) ||
+    isIndianStockAsset(asset.assetClass, asset.country, ticker) ||
+    isMassiveCandidateTicker(ticker) ||
+    isCanadianAutoMatchTicker(ticker, asset.country)
+  );
 }
 
 export async function fetchStockPrice(
@@ -224,6 +289,62 @@ export function inferCurrencyFromTicker(ticker: string) {
   return 'USD';
 }
 
+export function isIndianMutualFundAsset(assetClass: string, country: string, ticker?: string) {
+  const normalizedAssetClass = assetClass.trim().toLowerCase();
+  const normalizedCountry = country.trim().toLowerCase();
+  const normalizedTicker = ticker?.trim().toUpperCase() || '';
+
+  if (normalizedCountry !== 'india') return false;
+
+  if (
+    normalizedAssetClass === 'mutual fund' ||
+    normalizedAssetClass === 'mutual funds' ||
+    normalizedAssetClass === 'mf' ||
+    normalizedAssetClass === 'mfs' ||
+    normalizedAssetClass.includes('mutual') ||
+    normalizedAssetClass.includes('fund')
+  ) {
+    return true;
+  }
+
+  return (
+    /^\d{5,}$/.test(normalizedTicker) ||
+    normalizedTicker.startsWith('INF') ||
+    /^OP[0-9A-Z.]+$/.test(normalizedTicker)
+  );
+}
+
+export function isIndianStockAsset(assetClass: string, country: string, ticker?: string) {
+  const normalizedAssetClass = assetClass.trim().toLowerCase();
+  const normalizedCountry = country.trim().toLowerCase();
+  const normalizedTicker = ticker?.trim().toUpperCase() || '';
+
+  return (
+    (normalizedCountry === 'india' && normalizedAssetClass === 'stocks') ||
+    normalizedTicker.startsWith('NSE:') ||
+    normalizedTicker.startsWith('BOM:')
+  );
+}
+
+export function isMassiveCandidateTicker(ticker: string) {
+  const trimmed = ticker.trim().toUpperCase();
+  if (!trimmed) return false;
+  if (trimmed.startsWith('NASDAQ:') || trimmed.startsWith('NYSE:') || trimmed.startsWith('AMEX:')) return true;
+  if (trimmed.includes(':')) return false;
+  if (trimmed.includes('.')) return false;
+  return /^[A-Z0-9.-]+$/.test(trimmed);
+}
+
+export function isCanadianAutoMatchTicker(ticker: string, country?: string) {
+  const trimmed = ticker.trim().toUpperCase();
+  return (
+    trimmed.startsWith('TSE:') ||
+    trimmed.startsWith('CVE:') ||
+    trimmed.endsWith('.TO') ||
+    trimmed.endsWith('.V')
+  );
+}
+
 export function getTickerRecommendation(ticker: string, provider: PriceProvider) {
   const normalized = normalizeTickerForProvider(ticker, provider);
   if (!ticker) {
@@ -237,10 +358,25 @@ export function getTickerRecommendation(ticker: string, provider: PriceProvider)
 
 export async function getGoldPrice(currency: 'INR' | 'CAD' | 'USD') {
   try {
+    const quote = await fetchGoldSystemQuote();
+    const usdPerOunce = quote.price;
+
+    if (Number.isFinite(usdPerOunce) && usdPerOunce > 0) {
+      const usdPerGram = usdPerOunce / 31.1034768;
+      if (currency === 'USD') return usdPerGram;
+
+      const rates = await fetchExchangeRates('USD');
+      if (rates) {
+        if (currency === 'INR' && rates.INR) return usdPerGram * rates.INR;
+        if (currency === 'CAD' && rates.CAD) return usdPerGram * rates.CAD;
+      }
+    }
+
+    // Fallback to the older XAU exchange-rate route if the gold endpoint is unavailable.
     const rates = await fetchExchangeRates('USD');
     if (rates && rates.XAU) {
-      const usdPerOunce = 1 / rates.XAU;
-      const usdPerGram = usdPerOunce / 31.1034768;
+      const fallbackUsdPerOunce = 1 / rates.XAU;
+      const usdPerGram = fallbackUsdPerOunce / 31.1034768;
 
       if (currency === 'USD') return usdPerGram;
       if (currency === 'INR') return usdPerGram * rates.INR;
@@ -250,6 +386,42 @@ export async function getGoldPrice(currency: 'INR' | 'CAD' | 'USD') {
   } catch (error) {
     console.error('Failed to fetch gold price:', error);
     return null;
+  }
+}
+
+export async function fetchGoldSystemQuote(): Promise<PriceFetchResult> {
+  try {
+    const response = await fetch('https://api.gold-api.com/price/XAU');
+    const data = await safeJson(response);
+    const price = Number(data?.price);
+
+    if (response.ok && Number.isFinite(price) && price > 0) {
+      return {
+        price,
+        provider: 'gold',
+        normalizedTicker: 'XAU',
+        currency: 'USD',
+        sourceUrl: 'https://gold-api.com/',
+      };
+    }
+
+    return {
+      price: null,
+      provider: 'gold',
+      normalizedTicker: 'XAU',
+      currency: 'USD',
+      sourceUrl: 'https://gold-api.com/',
+      error: data?.error || 'Gold API did not return a valid gold quote.',
+    };
+  } catch (error) {
+    return {
+      price: null,
+      provider: 'gold',
+      normalizedTicker: 'XAU',
+      currency: 'USD',
+      sourceUrl: 'https://gold-api.com/',
+      error: error instanceof Error ? error.message : 'Gold quote lookup failed.',
+    };
   }
 }
 
@@ -418,14 +590,23 @@ function dedupeProviders(providers: PriceProvider[]) {
   return Array.from(new Set(providers));
 }
 
-function prioritizeAvailableProviders(providers: PriceProvider[]) {
-  if (!isYahooCooldownActive()) return providers;
+function prioritizeAvailableProviders(
+  providers: PriceProvider[],
+  settings: PriceProviderSettings = DEFAULT_PRICE_PROVIDER_SETTINGS,
+) {
+  const preferNonYahoo = isYahooCooldownActive() || hasConfiguredNonYahooProvider(settings);
+  if (!preferNonYahoo) return providers;
+
   return [...providers].sort((left, right) => {
     if (left === right) return 0;
     if (left === 'yahoo') return 1;
     if (right === 'yahoo') return -1;
     return 0;
   });
+}
+
+export function hasConfiguredNonYahooProvider(settings: PriceProviderSettings = DEFAULT_PRICE_PROVIDER_SETTINGS) {
+  return Boolean(settings.alphaVantageApiKey?.trim() || settings.finnhubApiKey?.trim());
 }
 
 function delay(ms: number) {
@@ -518,7 +699,7 @@ function isYahooRateLimitMessage(message?: string) {
   return normalizedMessage.includes('429') || normalizedMessage.includes('rate limit');
 }
 
-function buildProviderQuoteUrl(provider: PriceProvider, ticker: string) {
+function buildProviderQuoteUrl(provider: ResolvedPriceProvider, ticker: string) {
   switch (provider) {
     case 'yahoo':
       return `https://finance.yahoo.com/quote/${encodeURIComponent(ticker)}`;
@@ -526,7 +707,19 @@ function buildProviderQuoteUrl(provider: PriceProvider, ticker: string) {
       return `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${encodeURIComponent(ticker)}`;
     case 'finnhub':
       return `https://finnhub.io/quote?symbol=${encodeURIComponent(ticker)}`;
+    case 'massive':
+      return `https://massive.com/stocks/${encodeURIComponent(ticker)}`;
+    case 'amfi':
+      return 'https://www.amfiindia.com/net-asset-value/nav-download';
+    case 'upstox':
+      return 'https://upstox.com/developer/api-documentation/market-quote/';
+    case 'gold':
+      return 'https://gold-api.com/';
     default:
       return undefined;
   }
+}
+
+function isResolvedPriceProvider(value: unknown): value is ResolvedPriceProvider {
+  return value === 'yahoo' || value === 'alphavantage' || value === 'finnhub' || value === 'massive' || value === 'amfi' || value === 'upstox' || value === 'gold';
 }

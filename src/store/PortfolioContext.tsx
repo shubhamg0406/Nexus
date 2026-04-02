@@ -9,8 +9,8 @@ import {
   setDoc,
   where,
 } from 'firebase/firestore';
-import { Asset, AssetClassDef } from './db';
-import { DEFAULT_PRICE_PROVIDER_SETTINGS, PriceProviderSettings, fetchExchangeRates, fetchPriceWithProviderOrder, getGoldPrice } from '../lib/api';
+import { Asset, AssetClassDef, getSetting, saveSetting } from './db';
+import { DEFAULT_PRICE_PROVIDER_SETTINGS, PriceProviderSettings, fetchAutoMatchedPriceForAsset, fetchExchangeRates, fetchGoldSystemQuote, isMassiveCandidateTicker } from '../lib/api';
 import { db } from '../lib/firebase';
 import { useAuth } from './AuthContext';
 import { applyPriceFormula } from '../lib/priceFormula';
@@ -28,6 +28,17 @@ import {
   type PortfolioSummary,
   selectActivePortfolioId,
 } from './portfolioHelpers';
+import {
+  DEFAULT_BROKER_CONNECTIONS,
+  DEFAULT_USER_PROVIDER_OVERRIDES,
+  type UserBrokerConnections,
+  type UserProviderOverrides,
+  getUserBrokerConnectionsKey,
+  getUserProviderOverridesKey,
+  mergePriceProviderSettings,
+  normalizeUserBrokerConnections,
+  normalizeUserProviderOverrides,
+} from './userPreferences';
 
 export interface ImportProgress {
   visible: boolean;
@@ -47,8 +58,13 @@ interface PortfolioContextType {
   baseCurrency: 'CAD' | 'INR' | 'USD' | 'ORIGINAL';
   setBaseCurrency: (currency: 'CAD' | 'INR' | 'USD' | 'ORIGINAL') => Promise<void>;
   rates: Record<string, number> | null;
+  sharedPriceProviderSettings: PriceProviderSettings;
   priceProviderSettings: PriceProviderSettings;
   updatePriceProviderSettings: (settings: PriceProviderSettings) => Promise<void>;
+  userProviderOverrides: UserProviderOverrides;
+  updateUserProviderOverrides: (settings: UserProviderOverrides) => Promise<void>;
+  userBrokerConnections: UserBrokerConnections;
+  updateUserBrokerConnections: (settings: UserBrokerConnections) => Promise<void>;
   addAsset: (asset: Omit<Asset, 'id'>) => Promise<void>;
   duplicateAsset: (id: string) => Promise<void>;
   updateAsset: (asset: Asset) => Promise<void>;
@@ -72,6 +88,11 @@ interface PortfolioContextType {
   inviteMember: (email: string, role?: PortfolioMember['role']) => Promise<void>;
   removeMember: (email: string) => Promise<void>;
   isRefreshing: boolean;
+  refreshQueue: {
+    pending: number;
+    nextRunAt: number | null;
+    provider: 'massive' | null;
+  };
   isPortfolioLoading: boolean;
   hasAccess: boolean;
   accessError: string | null;
@@ -82,6 +103,8 @@ interface PortfolioContextType {
 const PortfolioContext = createContext<PortfolioContextType | undefined>(undefined);
 
 const EMPTY_PROGRESS: ImportProgress = { visible: false, current: 0, total: 0, message: '' };
+const MASSIVE_REFRESH_BATCH_SIZE = 5;
+const MASSIVE_REFRESH_WINDOW_MS = 60 * 1000;
 const EMPTY_PORTFOLIO: PortfolioDocument = {
   assets: [],
   assetClasses: [],
@@ -101,14 +124,54 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
   const [portfolios, setPortfolios] = useState<PortfolioSummary[]>([]);
   const [activePortfolioId, setActivePortfolioIdState] = useState<string | null>(null);
   const [rates, setRates] = useState<Record<string, number> | null>(null);
+  const [userProviderOverrides, setUserProviderOverrides] = useState<UserProviderOverrides>(DEFAULT_USER_PROVIDER_OVERRIDES);
+  const [userBrokerConnections, setUserBrokerConnections] = useState<UserBrokerConnections>(DEFAULT_BROKER_CONNECTIONS);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [refreshQueue, setRefreshQueue] = useState<{ pending: number; nextRunAt: number | null; provider: 'massive' | null }>({
+    pending: 0,
+    nextRunAt: null,
+    provider: null,
+  });
   const [isPortfolioLoading, setIsPortfolioLoading] = useState(true);
   const [hasAccess, setHasAccess] = useState(false);
   const [accessError, setAccessError] = useState<string | null>(null);
   const [importProgress, setImportProgress] = useState<ImportProgress>(EMPTY_PROGRESS);
+  const effectivePriceProviderSettings = useMemo(
+    () => mergePriceProviderSettings(portfolio.priceProviderSettings, userProviderOverrides),
+    [portfolio.priceProviderSettings, userProviderOverrides],
+  );
+  const currentUserRole = useMemo(() => {
+    if (!user?.email) return null;
+    return portfolio.members.find((member) => member.email.toLowerCase() === user.email?.toLowerCase())?.role || null;
+  }, [portfolio.members, user?.email]);
 
   useEffect(() => {
     void loadRates();
+  }, []);
+
+  const portfolioRef = React.useRef(portfolio);
+  const ratesRef = React.useRef(rates);
+  const settingsRef = React.useRef(DEFAULT_PRICE_PROVIDER_SETTINGS);
+  const queueTimeoutRef = React.useRef<number | null>(null);
+
+  useEffect(() => {
+    portfolioRef.current = portfolio;
+  }, [portfolio]);
+
+  useEffect(() => {
+    ratesRef.current = rates;
+  }, [rates]);
+
+  useEffect(() => {
+    settingsRef.current = effectivePriceProviderSettings;
+  }, [effectivePriceProviderSettings]);
+
+  useEffect(() => {
+    return () => {
+      if (queueTimeoutRef.current != null) {
+        window.clearTimeout(queueTimeoutRef.current);
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -116,6 +179,8 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
       setPortfolio(EMPTY_PORTFOLIO);
       setPortfolios([]);
       setActivePortfolioIdState(null);
+      setUserProviderOverrides(DEFAULT_USER_PROVIDER_OVERRIDES);
+      setUserBrokerConnections(DEFAULT_BROKER_CONNECTIONS);
       setHasAccess(false);
       setAccessError(null);
       setIsPortfolioLoading(false);
@@ -205,14 +270,36 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
     window.localStorage.setItem(getActivePortfolioStorageKey(user.uid), activePortfolioId);
   }, [activePortfolioId, user?.uid]);
 
+  useEffect(() => {
+    if (!user?.uid) {
+      setUserProviderOverrides(DEFAULT_USER_PROVIDER_OVERRIDES);
+      setUserBrokerConnections(DEFAULT_BROKER_CONNECTIONS);
+      return;
+    }
+
+    let cancelled = false;
+
+    void Promise.all([
+      getSetting<UserProviderOverrides>(getUserProviderOverridesKey(user.uid)),
+      getSetting<UserBrokerConnections>(getUserBrokerConnectionsKey(user.uid)),
+    ]).then(([storedOverrides, storedBrokerConnections]) => {
+      if (cancelled) return;
+      setUserProviderOverrides(normalizeUserProviderOverrides(storedOverrides));
+      setUserBrokerConnections(normalizeUserBrokerConnections(storedBrokerConnections));
+    }).catch(() => {
+      if (cancelled) return;
+      setUserProviderOverrides(DEFAULT_USER_PROVIDER_OVERRIDES);
+      setUserBrokerConnections(DEFAULT_BROKER_CONNECTIONS);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.uid]);
+
   const setActivePortfolioId = (id: string) => {
     setActivePortfolioIdState(id);
   };
-
-  const currentUserRole = useMemo(() => {
-    if (!user?.email) return null;
-    return portfolio.members.find((member) => member.email.toLowerCase() === user.email?.toLowerCase())?.role || null;
-  }, [portfolio.members, user?.email]);
 
   const mutatePortfolio = async (updater: (current: PortfolioDocument) => PortfolioDocument) => {
     if (!activePortfolioId) {
@@ -250,6 +337,20 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
       ...current,
       priceProviderSettings: settings,
     }));
+  };
+
+  const updateUserProviderOverrides = async (settings: UserProviderOverrides) => {
+    const normalized = normalizeUserProviderOverrides(settings);
+    setUserProviderOverrides(normalized);
+    if (!user?.uid) return;
+    await saveSetting(getUserProviderOverridesKey(user.uid), normalized);
+  };
+
+  const updateUserBrokerConnections = async (settings: UserBrokerConnections) => {
+    const normalized = normalizeUserBrokerConnections(settings);
+    setUserBrokerConnections(normalized);
+    if (!user?.uid) return;
+    await saveSetting(getUserBrokerConnectionsKey(user.uid), normalized);
   };
 
   const setBaseCurrency = async (currency: 'CAD' | 'INR' | 'USD' | 'ORIGINAL') => {
@@ -311,7 +412,7 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
       const assetToRefresh = portfolio.assets.find((asset) => asset.id === id);
       if (!assetToRefresh) return;
 
-      const [refreshedAsset] = await refreshAssetPrices([assetToRefresh], currentRates, portfolio.priceProviderSettings, false, true);
+      const [refreshedAsset] = await refreshAssetPrices([assetToRefresh], currentRates, effectivePriceProviderSettings, false, true);
       await mutatePortfolio((current) => ({
         ...current,
         assets: current.assets.map((asset) => asset.id === id ? refreshedAsset : asset),
@@ -426,12 +527,54 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
   const refreshPrices = async () => {
     setIsRefreshing(true);
     try {
+      if (queueTimeoutRef.current != null) {
+        window.clearTimeout(queueTimeoutRef.current);
+        queueTimeoutRef.current = null;
+      }
+
       const currentRates = await loadRates() || rates;
-      const updatedAssets = await refreshAssetPrices(portfolio.assets, currentRates, portfolio.priceProviderSettings, false, true);
+      const queuePlan = buildMassiveRefreshQueuePlan(portfolio.assets);
+      const immediateIds = new Set(queuePlan.immediateAssetIds);
+      const queuedIds = new Set(queuePlan.queuedAssetIds);
+      const updatedImmediateAssets = await refreshAssetPrices(
+        portfolio.assets.filter((asset) => immediateIds.has(asset.id)),
+        currentRates,
+        effectivePriceProviderSettings,
+        false,
+        true,
+      );
+      const refreshedById = new Map(updatedImmediateAssets.map((asset) => [asset.id, asset]));
+      const nextRunAt = queuePlan.queuedAssetIds.length > 0 ? Date.now() + MASSIVE_REFRESH_WINDOW_MS : null;
+      const queuedMessage = nextRunAt ? buildQueuedRefreshMessage(nextRunAt) : undefined;
+
+      const updatedAssets = portfolio.assets.map((asset) => {
+        const refreshed = refreshedById.get(asset.id);
+        if (refreshed) return refreshed;
+        if (!queuedIds.has(asset.id)) return asset;
+
+        return {
+          ...asset,
+          priceFetchStatus: asset.currentPrice != null ? 'success' : asset.priceFetchStatus || 'idle',
+          priceFetchMessage: queuedMessage,
+          priceProvider: asset.priceProvider || 'massive',
+        };
+      });
+
       await mutatePortfolio((current) => ({
         ...current,
         assets: updatedAssets,
       }));
+
+      if (queuePlan.queuedAssetIds.length > 0 && nextRunAt) {
+        setRefreshQueue({
+          pending: queuePlan.queuedAssetIds.length,
+          nextRunAt,
+          provider: 'massive',
+        });
+        scheduleMassiveQueueProcessing(queuePlan.queuedAssetIds, nextRunAt);
+      } else {
+        setRefreshQueue({ pending: 0, nextRunAt: null, provider: null });
+      }
     } finally {
       setIsRefreshing(false);
     }
@@ -442,7 +585,7 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
     try {
       const currentRates = await loadRates() || rates;
       const failedAssets = portfolio.assets.filter((asset) => asset.priceFetchStatus === 'failed');
-      const refreshedFailedAssets = await refreshAssetPrices(failedAssets, currentRates, portfolio.priceProviderSettings, true, true);
+      const refreshedFailedAssets = await refreshAssetPrices(failedAssets, currentRates, effectivePriceProviderSettings, true, true);
       const refreshedById = new Map(refreshedFailedAssets.map((asset) => [asset.id, asset]));
 
       await mutatePortfolio((current) => ({
@@ -453,6 +596,62 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
       setIsRefreshing(false);
     }
   };
+
+  const scheduleMassiveQueueProcessing = React.useCallback((queuedIds: string[], nextRunAt: number) => {
+    const delayMs = Math.max(nextRunAt - Date.now(), 0);
+    queueTimeoutRef.current = window.setTimeout(async () => {
+      const currentPortfolio = portfolioRef.current;
+      const queuedAssets = currentPortfolio.assets.filter((asset) => queuedIds.includes(asset.id));
+      const queuePlan = buildMassiveRefreshQueuePlan(queuedAssets, true);
+
+      if (queuePlan.immediateAssetIds.length === 0) {
+        setRefreshQueue({ pending: 0, nextRunAt: null, provider: null });
+        queueTimeoutRef.current = null;
+        return;
+      }
+
+      const currentRates = await loadRates() || ratesRef.current;
+      const refreshedBatch = await refreshAssetPrices(
+        queuedAssets.filter((asset) => queuePlan.immediateAssetIds.includes(asset.id)),
+        currentRates,
+        settingsRef.current,
+        false,
+        true,
+      );
+      const refreshedById = new Map(refreshedBatch.map((asset) => [asset.id, asset]));
+      const remainingQueuedIds = queuePlan.queuedAssetIds;
+      const followingRunAt = remainingQueuedIds.length > 0 ? Date.now() + MASSIVE_REFRESH_WINDOW_MS : null;
+      const queuedMessage = followingRunAt ? buildQueuedRefreshMessage(followingRunAt) : undefined;
+
+      await mutatePortfolio((current) => ({
+        ...current,
+        assets: current.assets.map((asset) => {
+          const refreshed = refreshedById.get(asset.id);
+          if (refreshed) return refreshed;
+          if (!remainingQueuedIds.includes(asset.id)) return asset;
+
+          return {
+            ...asset,
+            priceFetchStatus: asset.currentPrice != null ? 'success' : asset.priceFetchStatus || 'idle',
+            priceFetchMessage: queuedMessage,
+            priceProvider: asset.priceProvider || 'massive',
+          };
+        }),
+      }));
+
+      if (remainingQueuedIds.length > 0 && followingRunAt) {
+        setRefreshQueue({
+          pending: remainingQueuedIds.length,
+          nextRunAt: followingRunAt,
+          provider: 'massive',
+        });
+        scheduleMassiveQueueProcessing(remainingQueuedIds, followingRunAt);
+      } else {
+        setRefreshQueue({ pending: 0, nextRunAt: null, provider: null });
+        queueTimeoutRef.current = null;
+      }
+    }, delayMs);
+  }, [mutatePortfolio]);
 
   return (
     <PortfolioContext.Provider value={{
@@ -466,8 +665,13 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
       baseCurrency: portfolio.baseCurrency,
       setBaseCurrency,
       rates,
-      priceProviderSettings: portfolio.priceProviderSettings,
+      sharedPriceProviderSettings: portfolio.priceProviderSettings,
+      priceProviderSettings: effectivePriceProviderSettings,
       updatePriceProviderSettings,
+      userProviderOverrides,
+      updateUserProviderOverrides,
+      userBrokerConnections,
+      updateUserBrokerConnections,
       addAsset,
       duplicateAsset,
       updateAsset,
@@ -486,6 +690,7 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
       inviteMember,
       removeMember,
       isRefreshing,
+      refreshQueue,
       isPortfolioLoading,
       hasAccess,
       accessError,
@@ -512,6 +717,8 @@ async function refreshAssetPrices(
   onlyFailedRows: boolean,
   forceTickerRefresh: boolean = false,
 ) {
+  const inFlightRefreshes = new Map<string, ReturnType<typeof fetchAutoMatchedPriceForAsset>>();
+
   return mapWithConcurrency(sourceAssets, 3, async (asset) => {
     if (!asset.autoUpdate && !(forceTickerRefresh && asset.ticker)) return asset;
     if (onlyFailedRows && asset.priceFetchStatus !== 'failed') return asset;
@@ -523,62 +730,102 @@ async function refreshAssetPrices(
     let priceProvider = asset.priceProvider;
 
     if (asset.ticker) {
-      const providerOrder = asset.preferredPriceProvider
-        ? [asset.preferredPriceProvider, priceProviderSettings.primaryProvider, priceProviderSettings.secondaryProvider]
-        : [priceProviderSettings.primaryProvider, priceProviderSettings.secondaryProvider];
-      const result = await fetchPriceWithProviderOrder(asset.ticker, providerOrder, priceProviderSettings);
-      if (result.price != null) {
+      try {
+        const refreshKey = [
+          asset.ticker.trim().toUpperCase(),
+          asset.name.trim().toUpperCase(),
+          asset.assetClass.trim().toUpperCase(),
+          asset.country.trim().toUpperCase(),
+          asset.preferredPriceProvider || '',
+        ].join('::');
+        let resultPromise = inFlightRefreshes.get(refreshKey);
+        if (!resultPromise) {
+          resultPromise = fetchAutoMatchedPriceForAsset(asset, priceProviderSettings);
+          inFlightRefreshes.set(refreshKey, resultPromise);
+        }
+        const result = await resultPromise;
+        if (result.price != null) {
+          const unitFactor = asset.priceUnitConversionFactor && asset.priceUnitConversionFactor > 0
+            ? asset.priceUnitConversionFactor
+            : 1;
+          const sourceCurrency = asset.priceSourceCurrency || normalizeCurrency(result.currency) || normalizeCurrency(asset.originalCurrency) || normalizeCurrency(asset.currency);
+          const targetCurrency = asset.priceTargetCurrency || normalizeCurrency(asset.currency) || sourceCurrency;
+          const liveFxFactor = getFxConversionFactor(sourceCurrency, targetCurrency, currentRates);
+          const legacyFactor = asset.priceConversionFactor && asset.priceConversionFactor > 0 ? asset.priceConversionFactor : 1;
+          const effectiveFactor = asset.priceSourceCurrency || asset.priceTargetCurrency || asset.priceUnitConversionFactor
+            ? liveFxFactor / unitFactor
+            : legacyFactor;
+          const formulaResult = asset.priceFormula
+            ? applyPriceFormula(asset.priceFormula, {
+                price: result.price,
+                fx: liveFxFactor,
+                unit: unitFactor,
+              })
+            : null;
+          const previousCloseFormulaResult = asset.priceFormula && result.previousClose != null
+            ? applyPriceFormula(asset.priceFormula, {
+                price: result.previousClose,
+                fx: liveFxFactor,
+                unit: unitFactor,
+              })
+            : null;
+
+          newPrice = formulaResult?.value != null ? formulaResult.value : result.price * effectiveFactor;
+          newPreviousClose = result.previousClose != null
+            ? previousCloseFormulaResult?.value != null
+              ? previousCloseFormulaResult.value
+              : result.previousClose * effectiveFactor
+            : asset.previousClose;
+          priceFetchStatus = 'success';
+          priceFetchMessage = formulaResult?.error || result.error || undefined;
+          priceProvider = result.provider;
+        } else {
+          const shouldKeepSavedPrice =
+            newPrice != null &&
+            isTemporaryPriceProviderIssue(result.error);
+
+          priceFetchStatus = shouldKeepSavedPrice ? 'success' : 'failed';
+          priceFetchMessage = shouldKeepSavedPrice
+            ? `Live refresh is temporarily unavailable for ${asset.ticker}. Using the last saved price for now.`
+            : result.error;
+          priceProvider = result.provider;
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : `Price refresh failed for ${asset.ticker}.`;
+        const shouldKeepSavedPrice =
+          newPrice != null &&
+          isTemporaryPriceProviderIssue(message);
+
+        priceFetchStatus = shouldKeepSavedPrice ? 'success' : 'failed';
+        priceFetchMessage = shouldKeepSavedPrice
+          ? `Live refresh is temporarily unavailable for ${asset.ticker}. Using the last saved price for now.`
+          : message;
+      }
+    } else if (asset.assetClass === 'Gold') {
+      const quote = await fetchGoldSystemQuote();
+      if (quote.price != null) {
         const unitFactor = asset.priceUnitConversionFactor && asset.priceUnitConversionFactor > 0
           ? asset.priceUnitConversionFactor
-          : 1;
-        const sourceCurrency = asset.priceSourceCurrency || normalizeCurrency(result.currency) || normalizeCurrency(asset.originalCurrency) || normalizeCurrency(asset.currency);
+          : 31.1035;
+        const sourceCurrency = asset.priceSourceCurrency || normalizeCurrency(quote.currency) || 'USD';
         const targetCurrency = asset.priceTargetCurrency || normalizeCurrency(asset.currency) || sourceCurrency;
         const liveFxFactor = getFxConversionFactor(sourceCurrency, targetCurrency, currentRates);
-        const legacyFactor = asset.priceConversionFactor && asset.priceConversionFactor > 0 ? asset.priceConversionFactor : 1;
-        const effectiveFactor = asset.priceSourceCurrency || asset.priceTargetCurrency || asset.priceUnitConversionFactor
-          ? liveFxFactor / unitFactor
-          : legacyFactor;
         const formulaResult = asset.priceFormula
           ? applyPriceFormula(asset.priceFormula, {
-              price: result.price,
-              fx: liveFxFactor,
-              unit: unitFactor,
-            })
-          : null;
-        const previousCloseFormulaResult = asset.priceFormula && result.previousClose != null
-          ? applyPriceFormula(asset.priceFormula, {
-              price: result.previousClose,
+              price: quote.price,
               fx: liveFxFactor,
               unit: unitFactor,
             })
           : null;
 
-        newPrice = formulaResult?.value != null ? formulaResult.value : result.price * effectiveFactor;
-        newPreviousClose = result.previousClose != null
-          ? previousCloseFormulaResult?.value != null
-            ? previousCloseFormulaResult.value
-            : result.previousClose * effectiveFactor
-          : asset.previousClose;
+        newPrice = formulaResult?.value != null ? formulaResult.value : (quote.price / unitFactor) * liveFxFactor;
         priceFetchStatus = 'success';
-        priceFetchMessage = formulaResult?.error || result.error || undefined;
-        priceProvider = result.provider;
-      } else {
-        priceFetchStatus = 'failed';
-        priceFetchMessage = result.error;
-        priceProvider = result.provider;
-      }
-    } else if (asset.assetClass === 'Gold') {
-      // Gold holdings without a custom ticker still fall back to the generic spot-price lookup.
-      const price = await getGoldPrice(asset.currency);
-      if (price) {
-        newPrice = price;
-        priceFetchStatus = 'success';
-        priceFetchMessage = undefined;
+        priceFetchMessage = formulaResult?.error || quote.error || undefined;
         priceProvider = 'gold';
       } else {
         priceFetchStatus = 'failed';
-        priceFetchMessage = 'Gold price lookup failed.';
-        priceProvider = undefined;
+        priceFetchMessage = quote.error || 'Gold price lookup failed.';
+        priceProvider = 'gold';
       }
     }
 
@@ -592,6 +839,90 @@ async function refreshAssetPrices(
       priceProvider,
     };
   });
+}
+
+function buildMassiveRefreshQueuePlan(sourceAssets: Asset[], forceQueueCandidates: boolean = false) {
+  const immediateAssetIds: string[] = [];
+  const queuedAssetIds: string[] = [];
+  const queuedGroupKeys = new Set<string>();
+  const activeGroupKeys = new Set<string>();
+
+  for (const asset of sourceAssets) {
+    if (!isMassiveQueuedAsset(asset, forceQueueCandidates)) {
+      immediateAssetIds.push(asset.id);
+      continue;
+    }
+
+    const queueKey = getMassiveQueueKey(asset);
+    if (!queueKey) {
+      immediateAssetIds.push(asset.id);
+      continue;
+    }
+
+    if (activeGroupKeys.has(queueKey)) {
+      immediateAssetIds.push(asset.id);
+      continue;
+    }
+
+    if (activeGroupKeys.size < MASSIVE_REFRESH_BATCH_SIZE) {
+      activeGroupKeys.add(queueKey);
+      immediateAssetIds.push(asset.id);
+      continue;
+    }
+
+    queuedGroupKeys.add(queueKey);
+    queuedAssetIds.push(asset.id);
+  }
+
+  if (queuedGroupKeys.size > 0) {
+    for (const asset of sourceAssets) {
+      const queueKey = getMassiveQueueKey(asset);
+      if (queueKey && queuedGroupKeys.has(queueKey) && !queuedAssetIds.includes(asset.id)) {
+        queuedAssetIds.push(asset.id);
+      }
+    }
+  }
+
+  return {
+    immediateAssetIds,
+    queuedAssetIds,
+  };
+}
+
+function isMassiveQueuedAsset(asset: Asset, forceQueueCandidates: boolean = false) {
+  if (!asset.autoUpdate || !asset.ticker) return false;
+  if (!isMassiveCandidateTicker(asset.ticker)) return false;
+  if (asset.country === 'India' || asset.country === 'Canada') return false;
+  if (forceQueueCandidates) return true;
+  return !isSameLocalDay(asset.lastUpdated);
+}
+
+function getMassiveQueueKey(asset: Asset) {
+  if (!asset.ticker) return '';
+  return [
+    asset.ticker.trim().toUpperCase(),
+    asset.name.trim().toUpperCase(),
+    asset.assetClass.trim().toUpperCase(),
+    asset.country.trim().toUpperCase(),
+  ].join('::');
+}
+
+function isSameLocalDay(timestamp?: number) {
+  if (!timestamp) return false;
+  const left = new Date(timestamp);
+  const right = new Date();
+  return (
+    left.getFullYear() === right.getFullYear() &&
+    left.getMonth() === right.getMonth() &&
+    left.getDate() === right.getDate()
+  );
+}
+
+function buildQueuedRefreshMessage(nextRunAt: number) {
+  return `Queued for the next Massive refresh window at ${new Date(nextRunAt).toLocaleTimeString([], {
+    hour: 'numeric',
+    minute: '2-digit',
+  })}. Showing the last saved price until then.`;
 }
 
 function normalizeCurrency(currency?: string | null): Asset['currency'] | null {

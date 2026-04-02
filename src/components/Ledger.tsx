@@ -36,7 +36,7 @@ const EMPTY_FILTER_STATE: FilterState = {
 };
 
 export function Ledger({ onEditAsset, onAddAsset }: { onEditAsset?: (asset: Asset) => void; onAddAsset?: () => void }) {
-  const { assets, baseCurrency, rates, priceProviderSettings, removeAsset, duplicateAsset, refreshAsset, refreshPrices, refreshFailedPrices, isRefreshing } = usePortfolio();
+  const { assets, baseCurrency, rates, priceProviderSettings, removeAsset, duplicateAsset, refreshAsset, refreshPrices, refreshFailedPrices, isRefreshing, refreshQueue } = usePortfolio();
   const [canadaSorting, setCanadaSorting] = useState<SortingState>([
     { id: 'name', desc: false },
   ]);
@@ -247,7 +247,7 @@ export function Ledger({ onEditAsset, onAddAsset }: { onEditAsset?: (asset: Asse
           const supportsTickerPricing = showsTickerManagement(asset);
           const hasFailedPrice = supportsTickerPricing && asset.priceFetchStatus === 'failed';
           const providerForRecommendation = asset.priceProvider === 'finnhub' || asset.priceProvider === 'alphavantage' || asset.priceProvider === 'yahoo' ? asset.priceProvider : 'yahoo';
-          const assetMeta = [asset.ticker || null, getCanonicalAssetClass(asset.assetClass), asset.owner].filter(Boolean).join(' • ');
+          const assetMeta = [shouldDisplayTicker(asset) ? asset.ticker || null : null, getCanonicalAssetClass(asset.assetClass), asset.owner].filter(Boolean).join(' • ');
           const isRowRefreshing = refreshingRowIds.includes(asset.id);
 
           return (
@@ -279,12 +279,12 @@ export function Ledger({ onEditAsset, onAddAsset }: { onEditAsset?: (asset: Asse
                       type="button"
                       onClick={() => setTickerRepairAsset(asset)}
                       className={`inline-flex items-center gap-1 text-xs font-medium ${hasFailedPrice ? 'text-amber-600 hover:text-amber-700' : 'text-slate-500 hover:text-slate-800 dark:hover:text-slate-100'}`}
-                      title={hasFailedPrice ? `${asset.priceFetchMessage || 'Price fetch failed.'} ${getTickerRecommendation(asset.ticker || '', providerForRecommendation)}` : 'Check or update ticker/provider'}
+                      title={hasFailedPrice ? `${asset.priceFetchMessage || 'Price fetch failed.'} ${getTickerRecommendation(asset.ticker || '', providerForRecommendation)}` : isGoldAsset(asset) ? 'Adjust system gold pricing settings' : 'Check or update ticker/provider'}
                     >
                       {hasFailedPrice ? <AlertTriangle className="h-3.5 w-3.5" /> : null}
-                      {asset.ticker ? 'Modify ticker' : 'Add ticker'}
+                      {getPricingActionLabel(asset)}
                     </button>
-                    {asset.ticker ? (
+                    {!isGoldAsset(asset) && asset.ticker ? (
                       <button
                         type="button"
                         onClick={() => void handleRefreshRow(asset.id)}
@@ -378,6 +378,12 @@ export function Ledger({ onEditAsset, onAddAsset }: { onEditAsset?: (asset: Asse
                 <div className="flex items-center gap-1 text-[11px] text-amber-600" title={`${asset.priceFetchMessage || 'Price fetch failed.'} ${getTickerRecommendation(asset.ticker || '', providerForRecommendation)}`}>
                   <AlertTriangle className="h-3.5 w-3.5" />
                   Last known value shown
+                </div>
+              )}
+              {!hasFailedPrice && isQueuedPriceMessage(asset.priceFetchMessage) && (
+                <div className="flex items-center gap-1 text-[11px] text-sky-600" title={asset.priceFetchMessage}>
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  Queued for next window
                 </div>
               )}
             </div>
@@ -637,6 +643,11 @@ export function Ledger({ onEditAsset, onAddAsset }: { onEditAsset?: (asset: Asse
                 <StatPill label="Failed" value={String(failedAssets.length)} onClick={() => setStatsModal({ type: 'failed', open: true })} />
                 <StatPill label="Manual" value={String(manualAssets.length)} onClick={() => setStatsModal({ type: 'manual', open: true })} />
               </div>
+              {refreshQueue.pending > 0 && refreshQueue.nextRunAt ? (
+                <div className="mt-4 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-800 dark:border-sky-900/60 dark:bg-sky-950/30 dark:text-sky-200">
+                  {refreshQueue.pending} U.S. stock row{refreshQueue.pending === 1 ? '' : 's'} are queued for the next Massive window at {formatQueueTime(refreshQueue.nextRunAt)}. Cached close prices stay visible until that batch runs.
+                </div>
+              ) : null}
               <div className="mt-4 text-sm text-slate-500 dark:text-slate-400">
                 Canada assets appear first, followed by India. Use the header filter icons for Excel-style column filtering and quick value selection.
               </div>
@@ -733,17 +744,17 @@ export function Ledger({ onEditAsset, onAddAsset }: { onEditAsset?: (asset: Asse
                         <div className="text-slate-500">Ticker</div>
                         {showsTickerManagement(asset) ? (
                           <>
-                            <div>{asset.ticker || '-'}</div>
+                            <div>{shouldDisplayTicker(asset) ? (asset.ticker || '-') : 'System gold feed'}</div>
                             <button
                               type="button"
                               onClick={() => setTickerRepairAsset(asset)}
                               className={`mt-1 inline-flex items-center gap-1 text-xs font-medium ${asset.priceFetchStatus === 'failed' ? 'text-amber-600' : 'text-slate-500'}`}
-                              title={asset.priceFetchStatus === 'failed' ? asset.priceFetchMessage || 'Price fetch failed.' : 'Check or update ticker/provider'}
+                              title={asset.priceFetchStatus === 'failed' ? asset.priceFetchMessage || 'Price fetch failed.' : isGoldAsset(asset) ? 'Adjust system gold pricing settings' : 'Check or update ticker/provider'}
                             >
                               {asset.priceFetchStatus === 'failed' ? <AlertTriangle className="h-3.5 w-3.5" /> : null}
-                              {asset.ticker ? 'Modify ticker' : 'Add ticker'}
+                              {getPricingActionLabel(asset)}
                             </button>
-                            {asset.ticker ? (
+                            {!isGoldAsset(asset) && asset.ticker ? (
                               <button
                                 type="button"
                                 onClick={() => void handleRefreshRow(asset.id)}
@@ -831,7 +842,7 @@ export function Ledger({ onEditAsset, onAddAsset }: { onEditAsset?: (asset: Asse
                       <div className="truncate text-sm font-semibold text-slate-900 dark:text-slate-100">{asset.name}</div>
                       <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
                         {getCanonicalAssetClass(asset.assetClass)} • {asset.owner} • {asset.country}
-                        {asset.ticker ? ` • ${asset.ticker}` : ''}
+                        {shouldDisplayTicker(asset) && asset.ticker ? ` • ${asset.ticker}` : ''}
                       </div>
                       <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
                         {asset.autoUpdate ? (
@@ -845,9 +856,9 @@ export function Ledger({ onEditAsset, onAddAsset }: { onEditAsset?: (asset: Asse
                       {supportsTickerPricing ? (
                         <>
                           <Button variant="outline" size="sm" onClick={() => setTickerRepairAsset(asset)}>
-                            {asset.ticker ? 'Modify ticker' : 'Add ticker'}
+                            {getPricingActionLabel(asset)}
                           </Button>
-                          {asset.ticker ? (
+                          {!isGoldAsset(asset) && asset.ticker ? (
                             <Button variant="outline" size="sm" onClick={() => void handleRefreshRow(asset.id)} disabled={isRowRefreshing}>
                               <RefreshCw className={`mr-2 h-3.5 w-3.5 ${isRowRefreshing ? 'animate-spin' : ''}`} />
                               Refresh row
@@ -927,6 +938,17 @@ function StatPill({ label, value, onClick }: React.PropsWithChildren<{ label: st
       <div className="mt-1 text-xl font-semibold text-slate-900 dark:text-slate-100">{value}</div>
     </button>
   );
+}
+
+function isQueuedPriceMessage(message?: string) {
+  return Boolean(message && message.toLowerCase().includes('queued for the next massive refresh window'));
+}
+
+function formatQueueTime(timestamp: number) {
+  return new Date(timestamp).toLocaleTimeString([], {
+    hour: 'numeric',
+    minute: '2-digit',
+  });
 }
 
 function CountryTableSection({
@@ -1093,7 +1115,20 @@ function usesTickerPricing(asset: Asset) {
 }
 
 function showsTickerManagement(asset: Asset) {
-  return asset.autoUpdate && (Boolean(asset.ticker) || usesTickerPricing(asset));
+  return asset.autoUpdate && (isGoldAsset(asset) || Boolean(asset.ticker) || usesTickerPricing(asset));
+}
+
+function isGoldAsset(asset: Asset) {
+  return asset.assetClass === 'Gold';
+}
+
+function shouldDisplayTicker(asset: Asset) {
+  return !isGoldAsset(asset);
+}
+
+function getPricingActionLabel(asset: Asset) {
+  if (isGoldAsset(asset)) return 'Price settings';
+  return asset.ticker ? 'Edit ticker' : 'Add ticker';
 }
 
 function getPreviousClose(asset: Asset) {

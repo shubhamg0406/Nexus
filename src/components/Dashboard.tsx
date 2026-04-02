@@ -84,7 +84,7 @@ type ChartAnalytics = {
 };
 
 export function Dashboard() {
-  const { assets, rates, refreshPrices, isRefreshing } = usePortfolio();
+  const { assets, rates, refreshPrices, isRefreshing, refreshQueue } = usePortfolio();
   const [scope, setScope] = useState<DashboardScope>('ALL');
   const [memberFilter, setMemberFilter] = useState('ALL');
   const [currencySelection, setCurrencySelection] = useState<CurrencySelection>('ORIGINAL');
@@ -660,6 +660,14 @@ export function Dashboard() {
           Refresh Rates
         </Button>
       </div>
+      {refreshQueue.pending > 0 && refreshQueue.nextRunAt ? (
+        <div className="rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-800 dark:border-sky-900/60 dark:bg-sky-950/30 dark:text-sky-200">
+          {refreshQueue.pending} U.S. stock row{refreshQueue.pending === 1 ? '' : 's'} are queued for the next Massive window at {new Date(refreshQueue.nextRunAt).toLocaleTimeString([], {
+            hour: 'numeric',
+            minute: '2-digit',
+          })}.
+        </div>
+      ) : null}
 
       <Card className="overflow-hidden rounded-3xl border-none bg-[radial-gradient(circle_at_top_left,_rgba(0,135,90,0.22),_transparent_40%),linear-gradient(135deg,_#052e2b,_#0f3d37_55%,_#0b5b46)] text-white shadow-[0_30px_90px_rgba(5,46,43,0.28)] dark:bg-[radial-gradient(circle_at_top_left,_rgba(61,255,191,0.18),_transparent_42%),linear-gradient(135deg,_#020617,_#052e2b_55%,_#0b5b46)]">
         <CardContent className="p-6 sm:p-8">
