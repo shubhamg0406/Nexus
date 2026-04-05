@@ -134,9 +134,25 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
     downloadCSV(csv, "india_holdings_template.csv");
   };
 
+  const downloadIndiaSampleTemplate = () => {
+    const rows = buildSampleHoldingsRows('India', assets);
+    const csv = Papa.unparse(rows, {
+      columns: ['Purchase Date', 'Owner', 'Holding Name', 'Ticker', 'Type', 'Holding Platform', 'Comments', 'Qty', 'Average Purchase Price', 'Purchase Value', 'Current Price', 'Current Value'],
+    });
+    downloadCSV(csv, "india_holdings_template_sample_data.csv");
+  };
+
   const downloadCanadaTemplate = () => {
     const csv = "Purchase Date,Owner,Holding Name,Ticker,Type,Holding Platform,Comments,Qty,Avg Purchase Price,Purchase Value,Current Price,Current Value,US or CAD";
     downloadCSV(csv, "canada_holdings_template.csv");
+  };
+
+  const downloadCanadaSampleTemplate = () => {
+    const rows = buildSampleHoldingsRows('Canada', assets);
+    const csv = Papa.unparse(rows, {
+      columns: ['Purchase Date', 'Owner', 'Holding Name', 'Ticker', 'Type', 'Holding Platform', 'Comments', 'Qty', 'Avg Purchase Price', 'Purchase Value', 'Current Price', 'Current Value', 'US or CAD'],
+    });
+    downloadCSV(csv, "canada_holdings_template_sample_data.csv");
   };
 
   const downloadClassesTemplate = () => {
@@ -248,6 +264,114 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+  };
+
+  const buildSampleHoldingsRows = (targetCountry: 'India' | 'Canada', sourceAssets: Asset[]) => {
+    const countryAssets = sourceAssets.filter((asset) => asset.country === targetCountry);
+    const seedAssets = countryAssets.length > 0
+      ? countryAssets.slice(0, Math.min(countryAssets.length, 8))
+      : buildFallbackSampleAssets(targetCountry);
+
+    return seedAssets.map((asset, index) => {
+      const sample = buildSampleHoldingRow(asset, targetCountry, index);
+      if (targetCountry === 'India') {
+        return {
+          'Purchase Date': sample.purchaseDate,
+          'Owner': sample.owner,
+          'Holding Name': sample.name,
+          'Ticker': sample.ticker,
+          'Type': sample.assetClass,
+          'Holding Platform': sample.holdingPlatform,
+          'Comments': sample.comments,
+          'Qty': sample.quantity,
+          'Average Purchase Price': sample.averagePurchasePrice,
+          'Purchase Value': sample.purchaseValue,
+          'Current Price': sample.currentPrice,
+          'Current Value': sample.currentValue,
+        };
+      }
+
+      return {
+        'Purchase Date': sample.purchaseDate,
+        'Owner': sample.owner,
+        'Holding Name': sample.name,
+        'Ticker': sample.ticker,
+        'Type': sample.assetClass,
+        'Holding Platform': sample.holdingPlatform,
+        'Comments': sample.comments,
+        'Qty': sample.quantity,
+        'Avg Purchase Price': sample.averagePurchasePrice,
+        'Purchase Value': sample.purchaseValue,
+        'Current Price': sample.currentPrice,
+        'Current Value': sample.currentValue,
+        'US or CAD': sample.originalCurrency,
+      };
+    });
+  };
+
+  const buildFallbackSampleAssets = (targetCountry: 'India' | 'Canada'): Asset[] => {
+    const fallbackClasses = [...SYSTEM_ASSET_CLASSES, ...assetClasses]
+      .filter((assetClass) => assetClass.country === targetCountry)
+      .slice(0, 6);
+
+    return fallbackClasses.map((assetClass, index) => ({
+      id: `sample-${targetCountry}-${index}`,
+      name: `${assetClass.name} Sample ${index + 1}`,
+      ticker: assetClass.name.toLowerCase().includes('stock')
+        ? (targetCountry === 'India' ? `NSE:SAMPLE${index + 1}` : `NASDAQ:SAMPLE${index + 1}`)
+        : '',
+      quantity: 1,
+      costBasis: 0,
+      currency: targetCountry === 'India' ? 'INR' : 'CAD',
+      owner: index % 2 === 0 ? 'Shubham Gupta' : 'Mayuri Garg',
+      country: targetCountry,
+      assetClass: assetClass.name,
+      autoUpdate: false,
+      holdingPlatform: targetCountry === 'India' ? 'Sample Platform' : 'Sample Brokerage',
+      comments: '',
+      originalCurrency: targetCountry === 'Canada' ? 'CAD' : undefined,
+    }));
+  };
+
+  const buildSampleHoldingRow = (asset: Asset, targetCountry: 'India' | 'Canada', index: number) => {
+    const isLiability = asset.assetClass.trim().toLowerCase() === 'credit card';
+    const quantity = isLiability ? 1 : Number(((index + 2) * 7.5).toFixed(2));
+    const averagePurchasePrice = Number((getSampleBasePrice(asset, targetCountry, index) * (isLiability ? 1 : 1)).toFixed(2));
+    const currentPrice = Number((averagePurchasePrice * (1 + getSampleDrift(index, isLiability))).toFixed(2));
+    const purchaseValue = Number((quantity * averagePurchasePrice).toFixed(2));
+    const currentValue = Number((quantity * currentPrice).toFixed(2));
+
+    return {
+      purchaseDate: `2024-${String((index % 9) + 1).padStart(2, '0')}-15`,
+      owner: asset.owner || (index % 2 === 0 ? 'Shubham Gupta' : 'Mayuri Garg'),
+      name: asset.name || `${asset.assetClass} Sample ${index + 1}`,
+      ticker: asset.ticker || '',
+      assetClass: asset.assetClass || 'Other',
+      holdingPlatform: asset.holdingPlatform || (targetCountry === 'India' ? 'Groww' : 'Wealthsimple'),
+      comments: asset.comments ? 'Sample import row based on existing structure' : '',
+      quantity,
+      averagePurchasePrice,
+      purchaseValue,
+      currentPrice,
+      currentValue,
+      originalCurrency: targetCountry === 'Canada' ? (asset.originalCurrency === 'USD' ? 'USD' : 'CAD') : undefined,
+    };
+  };
+
+  const getSampleBasePrice = (asset: Asset, targetCountry: 'India' | 'Canada', index: number) => {
+    const canonical = asset.assetClass.trim().toLowerCase();
+    if (canonical.includes('gold')) return targetCountry === 'India' ? 6450 + index * 120 : 118 + index * 7;
+    if (canonical.includes('credit')) return targetCountry === 'India' ? 12000 + index * 2500 : 1800 + index * 350;
+    if (canonical.includes('cash') || canonical.includes('bank')) return targetCountry === 'India' ? 1 : 1;
+    if (canonical === 'pf' || canonical === 'ppf' || canonical === 'fd' || canonical === 'nps') return targetCountry === 'India' ? 102 + index * 11 : 55 + index * 6;
+    if (canonical.includes('real estate')) return targetCountry === 'India' ? 2500000 + index * 150000 : 450000 + index * 25000;
+    if (canonical.includes('mutual')) return targetCountry === 'India' ? 82 + index * 9 : 24 + index * 4;
+    return targetCountry === 'India' ? 135 + index * 18 : 42 + index * 6;
+  };
+
+  const getSampleDrift = (index: number, isLiability: boolean) => {
+    const drift = [0.14, -0.06, 0.09, 0.03, -0.02, 0.11, 0.05, -0.04][index % 8];
+    return isLiability ? Math.abs(drift) : drift;
   };
 
   const parseCurrencyStr = (val: any) => {
@@ -1414,6 +1538,10 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
                 <Download className="mr-2 h-4 w-4" />
                 India Template
               </Button>
+              <Button variant="outline" onClick={downloadIndiaSampleTemplate}>
+                <Download className="mr-2 h-4 w-4" />
+                India Sample Template
+              </Button>
               <Button variant="outline" onClick={() => exportHoldings('India')}>
                 <Download className="mr-2 h-4 w-4" />
                 Export India Holdings
@@ -1433,6 +1561,10 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
                 <Download className="mr-2 h-4 w-4" />
                 Canada Template
               </Button>
+              <Button variant="outline" onClick={downloadCanadaSampleTemplate}>
+                <Download className="mr-2 h-4 w-4" />
+                Canada Sample Template
+              </Button>
               <Button variant="outline" onClick={() => exportHoldings('Canada')}>
                 <Download className="mr-2 h-4 w-4" />
                 Export Canada Holdings
@@ -1445,6 +1577,41 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
             </div>
           </div>
 
+        </CardContent>
+      </Card>
+
+      <Card className="border-none shadow-sm rounded-2xl">
+        <CardHeader>
+          <CardTitle>Asset Class Data</CardTitle>
+          <CardDescription>Import, export, or erase custom asset class definitions.</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <h3 className="text-sm font-medium text-slate-500 uppercase tracking-wider">Asset Class Library</h3>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" onClick={downloadClassesTemplate}>
+              <Download className="mr-2 h-4 w-4" />
+              Download Template
+            </Button>
+            <input type="file" accept=".csv,.tsv" className="hidden" ref={classesFileRef} onChange={handleClassesUpload} />
+            <Button variant="outline" onClick={() => classesFileRef.current?.click()}>
+              <Upload className="mr-2 h-4 w-4" />
+              Import Asset Classes
+            </Button>
+            <Button variant="destructive" onClick={() => {
+              setConfirmDialog({
+                open: true,
+                title: 'Erase All Classes',
+                description: 'Are you sure you want to erase ALL custom asset classes? This cannot be undone.',
+                onConfirm: () => {
+                  clearAllAssetClasses();
+                  setConfirmDialog(prev => ({ ...prev, open: false }));
+                }
+              });
+            }}>
+              <Trash2 className="mr-2 h-4 w-4" />
+              Erase All Classes
+            </Button>
+          </div>
         </CardContent>
       </Card>
 

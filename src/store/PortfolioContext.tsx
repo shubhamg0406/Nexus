@@ -10,7 +10,17 @@ import {
   where,
 } from 'firebase/firestore';
 import { Asset, AssetClassDef, getSetting, saveSetting } from './db';
-import { DEFAULT_PRICE_PROVIDER_SETTINGS, PriceProviderSettings, fetchAutoMatchedPriceForAsset, fetchExchangeRates, fetchGoldSystemQuote, isMassiveCandidateTicker } from '../lib/api';
+import {
+  DEFAULT_PRICE_PROVIDER_SETTINGS,
+  PriceProviderSettings,
+  fetchAutoMatchedPriceForAsset,
+  fetchExchangeRates,
+  fetchGoldSystemQuote,
+  isCanadianAutoMatchTicker,
+  isIndianMutualFundAsset,
+  isIndianStockAsset,
+  isMassiveCandidateTicker,
+} from '../lib/api';
 import { db } from '../lib/firebase';
 import { useAuth } from './AuthContext';
 import { applyPriceFormula } from '../lib/priceFormula';
@@ -91,8 +101,9 @@ interface PortfolioContextType {
   refreshQueue: {
     pending: number;
     nextRunAt: number | null;
-    provider: 'massive' | null;
+    provider: 'massive' | 'alphavantage' | null;
   };
+  bulkRefreshState: BulkRefreshRunState;
   isPortfolioLoading: boolean;
   hasAccess: boolean;
   accessError: string | null;
@@ -100,11 +111,58 @@ interface PortfolioContextType {
   setImportProgress: (progress: ImportProgress) => void;
 }
 
+type BulkRefreshProvider = 'amfi' | 'upstox' | 'gold' | 'massive' | 'alphavantage' | 'yahoo';
+type BulkRefreshQueueProvider = 'massive' | 'alphavantage';
+type BulkRefreshRowStatus =
+  | 'manual'
+  | 'updated_live'
+  | 'updated_close_today'
+  | 'using_cached_close_today'
+  | 'queued_next_window'
+  | 'blocked_missing_credentials'
+  | 'blocked_provider_limit'
+  | 'using_last_saved_price'
+  | 'failed_actionable'
+  | 'idle';
+
+interface BulkRefreshIssueSummary {
+  key: string;
+  label: string;
+  count: number;
+  tone: 'sky' | 'amber' | 'rose' | 'emerald' | 'slate';
+}
+
+interface BulkRefreshProviderQueue {
+  provider: BulkRefreshQueueProvider;
+  pendingRequests: number;
+  pendingRows: number;
+  nextRunAt: number | null;
+}
+
+export interface BulkRefreshRunState {
+  status: 'idle' | 'running' | 'queued' | 'completed' | 'partial';
+  startedAt: number | null;
+  completedAt: number | null;
+  counts: {
+    eligibleMarketLinked: number;
+    updatedNow: number;
+    usingCachedClose: number;
+    queued: number;
+    skippedManual: number;
+    blockedBySetup: number;
+    needsAttention: number;
+  };
+  queues: BulkRefreshProviderQueue[];
+  issues: BulkRefreshIssueSummary[];
+  note?: string;
+}
+
 const PortfolioContext = createContext<PortfolioContextType | undefined>(undefined);
 
 const EMPTY_PROGRESS: ImportProgress = { visible: false, current: 0, total: 0, message: '' };
 const MASSIVE_REFRESH_BATCH_SIZE = 5;
 const MASSIVE_REFRESH_WINDOW_MS = 60 * 1000;
+const ALPHAVANTAGE_REFRESH_BATCH_SIZE = 8;
 const EMPTY_PORTFOLIO: PortfolioDocument = {
   assets: [],
   assetClasses: [],
@@ -117,6 +175,22 @@ const EMPTY_PORTFOLIO: PortfolioDocument = {
   isPersonal: false,
   priceProviderSettings: DEFAULT_PRICE_PROVIDER_SETTINGS,
 };
+const EMPTY_BULK_REFRESH_STATE: BulkRefreshRunState = {
+  status: 'idle',
+  startedAt: null,
+  completedAt: null,
+  counts: {
+    eligibleMarketLinked: 0,
+    updatedNow: 0,
+    usingCachedClose: 0,
+    queued: 0,
+    skippedManual: 0,
+    blockedBySetup: 0,
+    needsAttention: 0,
+  },
+  queues: [],
+  issues: [],
+};
 
 export function PortfolioProvider({ children }: { children: React.ReactNode }) {
   const { user } = useAuth();
@@ -127,11 +201,12 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
   const [userProviderOverrides, setUserProviderOverrides] = useState<UserProviderOverrides>(DEFAULT_USER_PROVIDER_OVERRIDES);
   const [userBrokerConnections, setUserBrokerConnections] = useState<UserBrokerConnections>(DEFAULT_BROKER_CONNECTIONS);
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const [refreshQueue, setRefreshQueue] = useState<{ pending: number; nextRunAt: number | null; provider: 'massive' | null }>({
+  const [refreshQueue, setRefreshQueue] = useState<{ pending: number; nextRunAt: number | null; provider: 'massive' | 'alphavantage' | null }>({
     pending: 0,
     nextRunAt: null,
     provider: null,
   });
+  const [bulkRefreshState, setBulkRefreshState] = useState<BulkRefreshRunState>(EMPTY_BULK_REFRESH_STATE);
   const [isPortfolioLoading, setIsPortfolioLoading] = useState(true);
   const [hasAccess, setHasAccess] = useState(false);
   const [accessError, setAccessError] = useState<string | null>(null);
@@ -152,7 +227,8 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
   const portfolioRef = React.useRef(portfolio);
   const ratesRef = React.useRef(rates);
   const settingsRef = React.useRef(DEFAULT_PRICE_PROVIDER_SETTINGS);
-  const queueTimeoutRef = React.useRef<number | null>(null);
+  const massiveQueueTimeoutRef = React.useRef<number | null>(null);
+  const alphaVantageQueueTimeoutRef = React.useRef<number | null>(null);
 
   useEffect(() => {
     portfolioRef.current = portfolio;
@@ -167,9 +243,26 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
   }, [effectivePriceProviderSettings]);
 
   useEffect(() => {
+    setBulkRefreshState((current) => {
+      if (current.status === 'running') {
+        return current;
+      }
+      return summarizeBulkRefreshRun(portfolio.assets, {
+        startedAt: current.startedAt,
+        completedAt: current.completedAt,
+        queues: current.queues,
+        note: current.note,
+      });
+    });
+  }, [portfolio.assets]);
+
+  useEffect(() => {
     return () => {
-      if (queueTimeoutRef.current != null) {
-        window.clearTimeout(queueTimeoutRef.current);
+      if (massiveQueueTimeoutRef.current != null) {
+        window.clearTimeout(massiveQueueTimeoutRef.current);
+      }
+      if (alphaVantageQueueTimeoutRef.current != null) {
+        window.clearTimeout(alphaVantageQueueTimeoutRef.current);
       }
     };
   }, []);
@@ -181,6 +274,8 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
       setActivePortfolioIdState(null);
       setUserProviderOverrides(DEFAULT_USER_PROVIDER_OVERRIDES);
       setUserBrokerConnections(DEFAULT_BROKER_CONNECTIONS);
+      setBulkRefreshState(EMPTY_BULK_REFRESH_STATE);
+      setRefreshQueue({ pending: 0, nextRunAt: null, provider: null });
       setHasAccess(false);
       setAccessError(null);
       setIsPortfolioLoading(false);
@@ -422,6 +517,41 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
+  const applyBulkRefreshState = React.useCallback((
+    nextAssets: Asset[],
+    startedAt: number | null,
+    queues: BulkRefreshProviderQueue[],
+    note?: string,
+  ) => {
+    const nextState = summarizeBulkRefreshRun(nextAssets, {
+      startedAt,
+      completedAt: Date.now(),
+      queues,
+      note,
+    });
+    setBulkRefreshState(nextState);
+    const primaryQueue = queues
+      .filter((queue) => queue.pendingRows > 0 && queue.nextRunAt)
+      .sort((left, right) => {
+        if (!left.nextRunAt && !right.nextRunAt) return 0;
+        if (!left.nextRunAt) return 1;
+        if (!right.nextRunAt) return -1;
+        return left.nextRunAt - right.nextRunAt;
+      })[0];
+
+    setRefreshQueue(primaryQueue
+      ? {
+          pending: primaryQueue.pendingRows,
+          nextRunAt: primaryQueue.nextRunAt,
+          provider: primaryQueue.provider,
+        }
+      : {
+          pending: 0,
+          nextRunAt: null,
+          provider: null,
+        });
+  }, []);
+
   const importAssets = async (nextAssets: Asset[]) => {
     try {
       setImportProgress({ visible: true, current: 0, total: nextAssets.length, message: 'Importing holdings...' });
@@ -526,16 +656,42 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
 
   const refreshPrices = async () => {
     setIsRefreshing(true);
+    const startedAt = Date.now();
+    setBulkRefreshState((current) => ({
+      ...current,
+      status: 'running',
+      startedAt,
+      completedAt: null,
+      note: 'Refreshing all market-linked rows across providers.',
+    }));
     try {
-      if (queueTimeoutRef.current != null) {
-        window.clearTimeout(queueTimeoutRef.current);
-        queueTimeoutRef.current = null;
+      clearScheduledRefreshQueues(massiveQueueTimeoutRef, alphaVantageQueueTimeoutRef);
+      const currentRates = await loadRates() || rates;
+      const plan = buildBulkRefreshPlan(portfolio.assets);
+      const immediateIds = new Set([
+        ...plan.instantAssetIds,
+        ...plan.massive.immediateAssetIds,
+        ...plan.alphaVantage.immediateAssetIds,
+      ]);
+      const queuedAssetUpdates = new Map<string, Asset>();
+      const cachedAssetUpdates = new Map<string, Asset>();
+      const blockedAssetUpdates = new Map<string, Asset>();
+
+      for (const asset of portfolio.assets) {
+        if (plan.cachedAssetIds.includes(asset.id)) {
+          cachedAssetUpdates.set(asset.id, buildCachedCloseAsset(asset, resolveBulkRefreshProvider(asset)));
+        }
+        if (plan.massive.queuedAssetIds.includes(asset.id)) {
+          queuedAssetUpdates.set(asset.id, buildQueuedRefreshAsset(asset, 'massive', plan.massive.nextRunAt));
+        }
+        if (plan.alphaVantage.queuedAssetIds.includes(asset.id)) {
+          queuedAssetUpdates.set(asset.id, buildQueuedRefreshAsset(asset, 'alphavantage', plan.alphaVantage.nextRunAt));
+        }
+        if (plan.blockedReasons[asset.id]) {
+          blockedAssetUpdates.set(asset.id, buildBlockedRefreshAsset(asset, plan.blockedReasons[asset.id]));
+        }
       }
 
-      const currentRates = await loadRates() || rates;
-      const queuePlan = buildMassiveRefreshQueuePlan(portfolio.assets);
-      const immediateIds = new Set(queuePlan.immediateAssetIds);
-      const queuedIds = new Set(queuePlan.queuedAssetIds);
       const updatedImmediateAssets = await refreshAssetPrices(
         portfolio.assets.filter((asset) => immediateIds.has(asset.id)),
         currentRates,
@@ -544,20 +700,17 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
         true,
       );
       const refreshedById = new Map(updatedImmediateAssets.map((asset) => [asset.id, asset]));
-      const nextRunAt = queuePlan.queuedAssetIds.length > 0 ? Date.now() + MASSIVE_REFRESH_WINDOW_MS : null;
-      const queuedMessage = nextRunAt ? buildQueuedRefreshMessage(nextRunAt) : undefined;
 
       const updatedAssets = portfolio.assets.map((asset) => {
         const refreshed = refreshedById.get(asset.id);
         if (refreshed) return refreshed;
-        if (!queuedIds.has(asset.id)) return asset;
-
-        return {
-          ...asset,
-          priceFetchStatus: asset.currentPrice != null ? 'success' : asset.priceFetchStatus || 'idle',
-          priceFetchMessage: queuedMessage,
-          priceProvider: asset.priceProvider || 'massive',
-        };
+        const queued = queuedAssetUpdates.get(asset.id);
+        if (queued) return queued;
+        const cached = cachedAssetUpdates.get(asset.id);
+        if (cached) return cached;
+        const blocked = blockedAssetUpdates.get(asset.id);
+        if (blocked) return blocked;
+        return asset;
       });
 
       await mutatePortfolio((current) => ({
@@ -565,16 +718,14 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
         assets: updatedAssets,
       }));
 
-      if (queuePlan.queuedAssetIds.length > 0 && nextRunAt) {
-        setRefreshQueue({
-          pending: queuePlan.queuedAssetIds.length,
-          nextRunAt,
-          provider: 'massive',
-        });
-        scheduleMassiveQueueProcessing(queuePlan.queuedAssetIds, nextRunAt);
-      } else {
-        setRefreshQueue({ pending: 0, nextRunAt: null, provider: null });
+      const queues = buildBulkRefreshQueues(plan);
+      if (plan.massive.queuedAssetIds.length > 0 && plan.massive.nextRunAt) {
+        scheduleQueuedProviderProcessing('massive', plan.massive.queuedAssetIds, plan.massive.nextRunAt);
       }
+      if (plan.alphaVantage.queuedAssetIds.length > 0 && plan.alphaVantage.nextRunAt) {
+        scheduleQueuedProviderProcessing('alphavantage', plan.alphaVantage.queuedAssetIds, plan.alphaVantage.nextRunAt);
+      }
+      applyBulkRefreshState(updatedAssets, startedAt, queues, 'Refresh all covers all market-linked rows, not just the filtered table view.');
     } finally {
       setIsRefreshing(false);
     }
@@ -582,31 +733,35 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
 
   const refreshFailedPrices = async () => {
     setIsRefreshing(true);
+    const startedAt = Date.now();
     try {
       const currentRates = await loadRates() || rates;
-      const failedAssets = portfolio.assets.filter((asset) => asset.priceFetchStatus === 'failed');
+      const failedAssets = portfolio.assets.filter((asset) => getBulkRefreshRowStatus(asset) === 'failed_actionable');
       const refreshedFailedAssets = await refreshAssetPrices(failedAssets, currentRates, effectivePriceProviderSettings, true, true);
       const refreshedById = new Map(refreshedFailedAssets.map((asset) => [asset.id, asset]));
 
+      const updatedAssets = portfolio.assets.map((asset) => refreshedById.get(asset.id) || asset);
       await mutatePortfolio((current) => ({
         ...current,
-        assets: current.assets.map((asset) => refreshedById.get(asset.id) || asset),
+        assets: updatedAssets,
       }));
+      applyBulkRefreshState(updatedAssets, startedAt, bulkRefreshState.queues, 'Retried actionable price rows only.');
     } finally {
       setIsRefreshing(false);
     }
   };
 
-  const scheduleMassiveQueueProcessing = React.useCallback((queuedIds: string[], nextRunAt: number) => {
+  const scheduleQueuedProviderProcessing = React.useCallback((provider: BulkRefreshQueueProvider, queuedIds: string[], nextRunAt: number) => {
     const delayMs = Math.max(nextRunAt - Date.now(), 0);
-    queueTimeoutRef.current = window.setTimeout(async () => {
+    const timeoutRef = provider === 'massive' ? massiveQueueTimeoutRef : alphaVantageQueueTimeoutRef;
+    timeoutRef.current = window.setTimeout(async () => {
       const currentPortfolio = portfolioRef.current;
       const queuedAssets = currentPortfolio.assets.filter((asset) => queuedIds.includes(asset.id));
-      const queuePlan = buildMassiveRefreshQueuePlan(queuedAssets, true);
+      const queuePlan = buildQueuedProviderPlan(provider, queuedAssets, true);
 
       if (queuePlan.immediateAssetIds.length === 0) {
-        setRefreshQueue({ pending: 0, nextRunAt: null, provider: null });
-        queueTimeoutRef.current = null;
+        timeoutRef.current = null;
+        applyBulkRefreshState(currentPortfolio.assets, bulkRefreshState.startedAt, bulkRefreshState.queues.filter((queue) => queue.provider !== provider));
         return;
       }
 
@@ -620,38 +775,47 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
       );
       const refreshedById = new Map(refreshedBatch.map((asset) => [asset.id, asset]));
       const remainingQueuedIds = queuePlan.queuedAssetIds;
-      const followingRunAt = remainingQueuedIds.length > 0 ? Date.now() + MASSIVE_REFRESH_WINDOW_MS : null;
-      const queuedMessage = followingRunAt ? buildQueuedRefreshMessage(followingRunAt) : undefined;
+      const followingRunAt = queuePlan.nextRunAt;
+      const queuedUpdates = new Map<string, Asset>(
+        queuedAssets
+          .filter((asset) => remainingQueuedIds.includes(asset.id))
+          .map((asset) => [asset.id, buildQueuedRefreshAsset(asset, provider, followingRunAt)]),
+      );
+
+      const updatedAssets = currentPortfolio.assets.map((asset) => {
+        const refreshed = refreshedById.get(asset.id);
+        if (refreshed) return refreshed;
+        const queued = queuedUpdates.get(asset.id);
+        if (queued) return queued;
+        return asset;
+      });
 
       await mutatePortfolio((current) => ({
         ...current,
-        assets: current.assets.map((asset) => {
-          const refreshed = refreshedById.get(asset.id);
-          if (refreshed) return refreshed;
-          if (!remainingQueuedIds.includes(asset.id)) return asset;
-
-          return {
-            ...asset,
-            priceFetchStatus: asset.currentPrice != null ? 'success' : asset.priceFetchStatus || 'idle',
-            priceFetchMessage: queuedMessage,
-            priceProvider: asset.priceProvider || 'massive',
-          };
-        }),
+        assets: updatedAssets,
       }));
 
+      const existingQueues = bulkRefreshState.queues.filter((queue) => queue.provider !== provider);
+      const nextQueues = remainingQueuedIds.length > 0 && followingRunAt
+        ? [
+            ...existingQueues,
+            {
+              provider,
+              pendingRequests: queuePlan.queuedRequestCount,
+              pendingRows: remainingQueuedIds.length,
+              nextRunAt: followingRunAt,
+            } satisfies BulkRefreshProviderQueue,
+          ]
+        : existingQueues;
+
       if (remainingQueuedIds.length > 0 && followingRunAt) {
-        setRefreshQueue({
-          pending: remainingQueuedIds.length,
-          nextRunAt: followingRunAt,
-          provider: 'massive',
-        });
-        scheduleMassiveQueueProcessing(remainingQueuedIds, followingRunAt);
+        scheduleQueuedProviderProcessing(provider, remainingQueuedIds, followingRunAt);
       } else {
-        setRefreshQueue({ pending: 0, nextRunAt: null, provider: null });
-        queueTimeoutRef.current = null;
+        timeoutRef.current = null;
       }
+      applyBulkRefreshState(updatedAssets, bulkRefreshState.startedAt, nextQueues);
     }, delayMs);
-  }, [mutatePortfolio]);
+  }, [bulkRefreshState.queues, bulkRefreshState.startedAt, mutatePortfolio]);
 
   return (
     <PortfolioContext.Provider value={{
@@ -691,6 +855,7 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
       removeMember,
       isRefreshing,
       refreshQueue,
+      bulkRefreshState,
       isPortfolioLoading,
       hasAccess,
       accessError,
@@ -777,7 +942,7 @@ async function refreshAssetPrices(
               : result.previousClose * effectiveFactor
             : asset.previousClose;
           priceFetchStatus = 'success';
-          priceFetchMessage = formulaResult?.error || result.error || undefined;
+          priceFetchMessage = formulaResult?.error || buildSuccessfulRefreshMessage(result.provider);
           priceProvider = result.provider;
         } else {
           const shouldKeepSavedPrice =
@@ -820,7 +985,7 @@ async function refreshAssetPrices(
 
         newPrice = formulaResult?.value != null ? formulaResult.value : (quote.price / unitFactor) * liveFxFactor;
         priceFetchStatus = 'success';
-        priceFetchMessage = formulaResult?.error || quote.error || undefined;
+        priceFetchMessage = formulaResult?.error || buildSuccessfulRefreshMessage('gold');
         priceProvider = 'gold';
       } else {
         priceFetchStatus = 'failed';
@@ -841,19 +1006,76 @@ async function refreshAssetPrices(
   });
 }
 
-function buildMassiveRefreshQueuePlan(sourceAssets: Asset[], forceQueueCandidates: boolean = false) {
+function buildBulkRefreshPlan(sourceAssets: Asset[]) {
+  const instantAssetIds: string[] = [];
+  const cachedAssetIds: string[] = [];
+  const blockedReasons: Record<string, string> = {};
+  const massiveCandidates: Asset[] = [];
+  const alphaVantageCandidates: Asset[] = [];
+
+  for (const asset of sourceAssets) {
+    if (!asset.autoUpdate) continue;
+
+    const provider = resolveBulkRefreshProvider(asset);
+
+    if (!provider) {
+      blockedReasons[asset.id] = 'Live pricing is enabled, but this row does not have a supported market-linked route yet.';
+      continue;
+    }
+
+    if (!asset.ticker && provider !== 'gold') {
+      blockedReasons[asset.id] = 'This row needs a valid ticker before it can refresh automatically.';
+      continue;
+    }
+
+    if (provider === 'massive') {
+      if (asset.currentPrice != null && isSameLocalDay(asset.lastUpdated)) {
+        cachedAssetIds.push(asset.id);
+      } else {
+        massiveCandidates.push(asset);
+      }
+      continue;
+    }
+
+    if (provider === 'alphavantage') {
+      if (asset.currentPrice != null && isSameLocalDay(asset.lastUpdated)) {
+        cachedAssetIds.push(asset.id);
+      } else {
+        alphaVantageCandidates.push(asset);
+      }
+      continue;
+    }
+
+    instantAssetIds.push(asset.id);
+  }
+
+  return {
+    instantAssetIds,
+    cachedAssetIds,
+    blockedReasons,
+    massive: buildQueuedProviderPlan('massive', massiveCandidates),
+    alphaVantage: buildQueuedProviderPlan('alphavantage', alphaVantageCandidates),
+  };
+}
+
+function buildQueuedProviderPlan(
+  provider: BulkRefreshQueueProvider,
+  sourceAssets: Asset[],
+  forceQueueCandidates: boolean = false,
+) {
+  const batchSize = provider === 'massive' ? MASSIVE_REFRESH_BATCH_SIZE : ALPHAVANTAGE_REFRESH_BATCH_SIZE;
   const immediateAssetIds: string[] = [];
   const queuedAssetIds: string[] = [];
   const queuedGroupKeys = new Set<string>();
   const activeGroupKeys = new Set<string>();
 
   for (const asset of sourceAssets) {
-    if (!isMassiveQueuedAsset(asset, forceQueueCandidates)) {
+    if (!isQueuedProviderCandidate(provider, asset, forceQueueCandidates)) {
       immediateAssetIds.push(asset.id);
       continue;
     }
 
-    const queueKey = getMassiveQueueKey(asset);
+    const queueKey = getQueuedProviderKey(provider, asset);
     if (!queueKey) {
       immediateAssetIds.push(asset.id);
       continue;
@@ -864,7 +1086,7 @@ function buildMassiveRefreshQueuePlan(sourceAssets: Asset[], forceQueueCandidate
       continue;
     }
 
-    if (activeGroupKeys.size < MASSIVE_REFRESH_BATCH_SIZE) {
+    if (activeGroupKeys.size < batchSize) {
       activeGroupKeys.add(queueKey);
       immediateAssetIds.push(asset.id);
       continue;
@@ -876,35 +1098,124 @@ function buildMassiveRefreshQueuePlan(sourceAssets: Asset[], forceQueueCandidate
 
   if (queuedGroupKeys.size > 0) {
     for (const asset of sourceAssets) {
-      const queueKey = getMassiveQueueKey(asset);
+      const queueKey = getQueuedProviderKey(provider, asset);
       if (queueKey && queuedGroupKeys.has(queueKey) && !queuedAssetIds.includes(asset.id)) {
         queuedAssetIds.push(asset.id);
       }
     }
   }
 
+  const nextRunAt = queuedAssetIds.length > 0
+    ? provider === 'massive'
+      ? Date.now() + MASSIVE_REFRESH_WINDOW_MS
+      : getNextAlphaVantageRunAt()
+    : null;
+
   return {
     immediateAssetIds,
     queuedAssetIds,
+    queuedRequestCount: queuedGroupKeys.size,
+    nextRunAt,
   };
 }
 
-function isMassiveQueuedAsset(asset: Asset, forceQueueCandidates: boolean = false) {
+function isQueuedProviderCandidate(provider: BulkRefreshQueueProvider, asset: Asset, forceQueueCandidates: boolean = false) {
   if (!asset.autoUpdate || !asset.ticker) return false;
-  if (!isMassiveCandidateTicker(asset.ticker)) return false;
-  if (asset.country === 'India' || asset.country === 'Canada') return false;
+
+  if (provider === 'massive') {
+    if (!isMassiveCandidateTicker(asset.ticker)) return false;
+    if (asset.country === 'India' || asset.country === 'Canada') return false;
+  }
+
+  if (provider === 'alphavantage') {
+    if (!isCanadianAutoMatchTicker(asset.ticker, asset.country)) return false;
+  }
+
   if (forceQueueCandidates) return true;
-  return !isSameLocalDay(asset.lastUpdated);
+  return true;
 }
 
-function getMassiveQueueKey(asset: Asset) {
-  if (!asset.ticker) return '';
+function getQueuedProviderKey(provider: BulkRefreshQueueProvider, asset: Asset) {
+  const providerKey = provider === 'alphavantage'
+    ? normalizeAlphaVantageQueueTicker(asset.ticker || '')
+    : asset.ticker?.trim().toUpperCase() || '';
+  if (!providerKey) return '';
+
   return [
-    asset.ticker.trim().toUpperCase(),
-    asset.name.trim().toUpperCase(),
+    provider,
+    providerKey,
     asset.assetClass.trim().toUpperCase(),
     asset.country.trim().toUpperCase(),
   ].join('::');
+}
+
+function normalizeAlphaVantageQueueTicker(ticker: string) {
+  const trimmed = ticker.trim().toUpperCase();
+  if (trimmed.startsWith('TSE:')) return `${trimmed.slice(4)}.TRT`;
+  if (trimmed.startsWith('CVE:')) return `${trimmed.slice(4)}.TRV`;
+  if (trimmed.endsWith('.TO')) return `${trimmed.slice(0, -3)}.TRT`;
+  if (trimmed.endsWith('.V')) return `${trimmed.slice(0, -2)}.TRV`;
+  return trimmed;
+}
+
+function resolveBulkRefreshProvider(asset: Asset): BulkRefreshProvider | null {
+  if (asset.assetClass === 'Gold') return 'gold';
+
+  const ticker = asset.ticker?.trim() || '';
+  if (isIndianMutualFundAsset(asset.assetClass, asset.country, ticker)) return 'amfi';
+  if (isIndianStockAsset(asset.assetClass, asset.country, ticker)) return 'upstox';
+  if (ticker && isMassiveCandidateTicker(ticker) && asset.country !== 'India' && asset.country !== 'Canada') return 'massive';
+  if (ticker && isCanadianAutoMatchTicker(ticker, asset.country)) return 'alphavantage';
+  if (ticker) return 'yahoo';
+  return null;
+}
+
+function buildBulkRefreshQueues(plan: ReturnType<typeof buildBulkRefreshPlan>) {
+  return [
+    plan.massive.queuedAssetIds.length > 0 && plan.massive.nextRunAt
+      ? {
+          provider: 'massive',
+          pendingRequests: plan.massive.queuedRequestCount,
+          pendingRows: plan.massive.queuedAssetIds.length,
+          nextRunAt: plan.massive.nextRunAt,
+        }
+      : null,
+    plan.alphaVantage.queuedAssetIds.length > 0 && plan.alphaVantage.nextRunAt
+      ? {
+          provider: 'alphavantage',
+          pendingRequests: plan.alphaVantage.queuedRequestCount,
+          pendingRows: plan.alphaVantage.queuedAssetIds.length,
+          nextRunAt: plan.alphaVantage.nextRunAt,
+        }
+      : null,
+  ].filter(Boolean) as BulkRefreshProviderQueue[];
+}
+
+function buildCachedCloseAsset(asset: Asset, provider: BulkRefreshProvider | null): Asset {
+  if (!provider) return asset;
+  return {
+    ...asset,
+    priceFetchStatus: 'success',
+    priceFetchMessage: buildCachedCloseMessage(provider),
+    priceProvider: provider,
+  };
+}
+
+function buildQueuedRefreshAsset(asset: Asset, provider: BulkRefreshQueueProvider, nextRunAt: number | null): Asset {
+  return {
+    ...asset,
+    priceFetchStatus: asset.currentPrice != null ? 'success' : asset.priceFetchStatus || 'idle',
+    priceFetchMessage: buildQueuedRefreshMessage(provider, nextRunAt),
+    priceProvider: provider,
+  };
+}
+
+function buildBlockedRefreshAsset(asset: Asset, message: string): Asset {
+  return {
+    ...asset,
+    priceFetchStatus: asset.currentPrice != null ? 'success' : 'failed',
+    priceFetchMessage: message,
+  };
 }
 
 function isSameLocalDay(timestamp?: number) {
@@ -918,11 +1229,195 @@ function isSameLocalDay(timestamp?: number) {
   );
 }
 
-function buildQueuedRefreshMessage(nextRunAt: number) {
-  return `Queued for the next Massive refresh window at ${new Date(nextRunAt).toLocaleTimeString([], {
+function buildQueuedRefreshMessage(provider: BulkRefreshQueueProvider, nextRunAt: number | null) {
+  if (!nextRunAt) {
+    return provider === 'massive'
+      ? 'Queued for the next Massive refresh window. Showing the last saved price until then.'
+      : 'Deferred until the next Alpha Vantage close refresh window. Showing the last saved price until then.';
+  }
+
+  const formattedTime = new Date(nextRunAt).toLocaleTimeString([], {
     hour: 'numeric',
     minute: '2-digit',
-  })}. Showing the last saved price until then.`;
+  });
+
+  return provider === 'massive'
+    ? `Queued for the next Massive refresh window at ${formattedTime}. Showing the last saved price until then.`
+    : `Queued for the next Alpha Vantage daily close window at ${formattedTime}. Showing the last saved price until then.`;
+}
+
+function buildCachedCloseMessage(provider: BulkRefreshProvider) {
+  switch (provider) {
+    case 'massive':
+      return 'Using today\'s cached U.S. close. Refresh all will fetch a new Massive close on the next eligible window.';
+    case 'alphavantage':
+      return 'Using today\'s cached Canada close. Refresh all will fetch a new Alpha Vantage close on the next eligible window.';
+    default:
+      return 'Using the most recent saved market price.';
+  }
+}
+
+function buildSuccessfulRefreshMessage(provider: string) {
+  switch (provider) {
+    case 'massive':
+      return 'Fetched today\'s U.S. close from Massive.';
+    case 'alphavantage':
+      return 'Fetched today\'s Canada close from Alpha Vantage.';
+    case 'amfi':
+      return 'Updated from the AMFI public feed.';
+    case 'upstox':
+      return 'Updated from the Upstox market route.';
+    case 'gold':
+      return 'Updated from the system gold feed.';
+    case 'yahoo':
+      return 'Updated from Yahoo Finance.';
+    default:
+      return 'Live price updated successfully.';
+  }
+}
+
+function getNextAlphaVantageRunAt(reference: Date = new Date()) {
+  const next = new Date(reference);
+  next.setDate(next.getDate() + 1);
+  next.setHours(9, 5, 0, 0);
+  return next.getTime();
+}
+
+function clearScheduledRefreshQueues(
+  massiveQueueTimeoutRef: React.MutableRefObject<number | null>,
+  alphaVantageQueueTimeoutRef: React.MutableRefObject<number | null>,
+) {
+  if (massiveQueueTimeoutRef.current != null) {
+    window.clearTimeout(massiveQueueTimeoutRef.current);
+    massiveQueueTimeoutRef.current = null;
+  }
+  if (alphaVantageQueueTimeoutRef.current != null) {
+    window.clearTimeout(alphaVantageQueueTimeoutRef.current);
+    alphaVantageQueueTimeoutRef.current = null;
+  }
+}
+
+function summarizeBulkRefreshRun(
+  assets: Asset[],
+  meta: {
+    startedAt: number | null;
+    completedAt?: number | null;
+    queues: BulkRefreshProviderQueue[];
+    note?: string;
+  },
+): BulkRefreshRunState {
+  const counts = {
+    eligibleMarketLinked: 0,
+    updatedNow: 0,
+    usingCachedClose: 0,
+    queued: 0,
+    skippedManual: 0,
+    blockedBySetup: 0,
+    needsAttention: 0,
+  };
+  const issuesMap = new Map<string, BulkRefreshIssueSummary>();
+
+  for (const asset of assets) {
+    const status = getBulkRefreshRowStatus(asset);
+    if (!asset.autoUpdate) {
+      counts.skippedManual += 1;
+      continue;
+    }
+
+    counts.eligibleMarketLinked += 1;
+    if (status === 'updated_live' || status === 'updated_close_today') counts.updatedNow += 1;
+    if (status === 'using_cached_close_today' || status === 'using_last_saved_price') counts.usingCachedClose += 1;
+    if (status === 'queued_next_window') counts.queued += 1;
+    if (status === 'blocked_missing_credentials' || status === 'blocked_provider_limit') counts.blockedBySetup += 1;
+    if (status === 'failed_actionable') counts.needsAttention += 1;
+
+    const issue = getBulkRefreshIssue(asset, status);
+    if (!issue) continue;
+    const existing = issuesMap.get(issue.key);
+    if (existing) {
+      existing.count += 1;
+    } else {
+      issuesMap.set(issue.key, { ...issue });
+    }
+  }
+
+  const issues = Array.from(issuesMap.values())
+    .sort((left, right) => right.count - left.count)
+    .slice(0, 4);
+  const status = counts.needsAttention > 0
+    ? 'partial'
+    : meta.queues.length > 0
+      ? 'queued'
+      : meta.startedAt
+        ? 'completed'
+        : 'idle';
+
+  return {
+    status,
+    startedAt: meta.startedAt,
+    completedAt: meta.completedAt ?? null,
+    counts,
+    queues: meta.queues,
+    issues,
+    note: meta.note,
+  };
+}
+
+function getBulkRefreshIssue(asset: Asset, status: BulkRefreshRowStatus): Omit<BulkRefreshIssueSummary, 'count'> | null {
+  if (status === 'queued_next_window') {
+    return asset.priceProvider === 'alphavantage'
+      ? { key: 'alphavantage-queued', label: 'Rows waiting for the next Alpha Vantage close window', tone: 'sky' }
+      : { key: 'massive-queued', label: 'Rows waiting for the next Massive window', tone: 'sky' };
+  }
+
+  if (status === 'blocked_missing_credentials') {
+    if ((asset.priceFetchMessage || '').toLowerCase().includes('upstox')) {
+      return { key: 'upstox-missing', label: 'Rows missing Upstox system access', tone: 'amber' };
+    }
+    if ((asset.priceFetchMessage || '').toLowerCase().includes('alpha vantage')) {
+      return { key: 'alphavantage-missing', label: 'Rows missing Alpha Vantage access', tone: 'amber' };
+    }
+    return { key: 'config-missing', label: 'Rows blocked by missing provider setup', tone: 'amber' };
+  }
+
+  if (status === 'using_last_saved_price' && (asset.priceProvider || '').toLowerCase() === 'yahoo') {
+    return { key: 'yahoo-fallback', label: 'Yahoo fallback rows using the last saved price', tone: 'slate' };
+  }
+
+  if (status === 'failed_actionable') {
+    return { key: 'ticker-attention', label: 'Rows that still need ticker or provider repair', tone: 'rose' };
+  }
+
+  return null;
+}
+
+export function getBulkRefreshRowStatus(asset: Asset): BulkRefreshRowStatus {
+  const message = (asset.priceFetchMessage || '').toLowerCase();
+
+  if (!asset.autoUpdate) return 'manual';
+  if (message.includes('queued for the next massive refresh window') || message.includes('queued for the next alpha vantage daily close window')) {
+    return 'queued_next_window';
+  }
+  if (message.includes('using today\'s cached') || message.includes('using today’s cached')) {
+    return 'using_cached_close_today';
+  }
+  if (message.includes('using the last saved price') || message.includes('using the last known server-side yahoo price')) {
+    return 'using_last_saved_price';
+  }
+  if (message.includes('api key is missing') || message.includes('access token') || message.includes('not configured') || message.includes('needs a valid ticker')) {
+    return 'blocked_missing_credentials';
+  }
+  if (message.includes('daily close window') || message.includes('rate-limiting') || message.includes('temporarily unavailable')) {
+    return asset.currentPrice != null ? 'blocked_provider_limit' : 'failed_actionable';
+  }
+  if (asset.priceFetchStatus === 'failed') {
+    return 'failed_actionable';
+  }
+  if (asset.priceFetchStatus === 'success') {
+    if (asset.priceProvider === 'massive' || asset.priceProvider === 'alphavantage') return 'updated_close_today';
+    return 'updated_live';
+  }
+  return 'idle';
 }
 
 function normalizeCurrency(currency?: string | null): Asset['currency'] | null {

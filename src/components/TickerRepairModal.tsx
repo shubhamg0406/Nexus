@@ -2,7 +2,7 @@ import React from 'react';
 import { AlertTriangle, CheckCircle2, ChevronDown, Loader2, Search } from 'lucide-react';
 import { Asset } from '../store/db';
 import { usePortfolio } from '../store/PortfolioContext';
-import { fetchAutoMatchedPriceForAsset, fetchGoldSystemQuote, getTickerRecommendation, hasConfiguredNonYahooProvider, inferCurrencyFromTicker, PriceFetchResult, PriceProvider, ResolvedPriceProvider } from '../lib/api';
+import { fetchAutoMatchedPriceForAsset, fetchGoldSystemQuote, getTickerRecommendation, hasConfiguredNonYahooProvider, inferCurrencyFromTicker, isCanadianAutoMatchTicker, isIndianMutualFundAsset, isIndianStockAsset, isMassiveCandidateTicker, PriceFetchResult, PriceProvider, ResolvedPriceProvider } from '../lib/api';
 import { Dialog, DialogDescription, DialogHeader, DialogTitle } from './ui/dialog';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
@@ -39,6 +39,7 @@ export function TickerRepairModal({ asset, open, onOpenChange }: TickerRepairMod
       ? (priceProviderSettings.finnhubApiKey?.trim() ? 'finnhub' : 'alphavantage')
       : priceProviderSettings.primaryProvider;
   const isGoldAsset = asset?.assetClass === 'Gold';
+  const routingInfo = React.useMemo(() => getRoutingInfo(asset, ticker), [asset, ticker]);
 
   React.useEffect(() => {
     if (!asset || !open) return;
@@ -86,7 +87,9 @@ export function TickerRepairModal({ asset, open, onOpenChange }: TickerRepairMod
 
   if (!asset) return null;
 
-  const recommendation = getTickerRecommendation(ticker, provider);
+  const recommendation = routingInfo.kind === 'system'
+    ? routingInfo.helperText
+    : getTickerRecommendation(ticker, provider);
   const quoteCurrency = getResolvedQuoteCurrency(result, ticker, asset, fromCurrency);
   const parsedCustomUnitFactor = Number(customUnitFactor);
   const unitFactor =
@@ -146,8 +149,8 @@ export function TickerRepairModal({ asset, open, onOpenChange }: TickerRepairMod
         ticker: isGoldAsset ? undefined : (ticker.trim() || undefined),
         autoUpdate: isGoldAsset ? true : Boolean(ticker.trim()),
         currentPrice: finalConvertedPrice ?? asset.currentPrice,
-        preferredPriceProvider: isGoldAsset ? undefined : provider,
-        priceProvider: isGoldAsset ? 'gold' : provider,
+        preferredPriceProvider: isGoldAsset || routingInfo.kind === 'system' ? undefined : provider,
+        priceProvider: isGoldAsset ? 'gold' : (result?.provider || routingInfo.provider || provider),
         priceFetchStatus: result?.price != null ? 'success' : asset.priceFetchStatus,
         priceFetchMessage: result?.price != null ? undefined : result?.error || asset.priceFetchMessage,
         priceUnitConversionFactor: unitFactor !== 1 ? unitFactor : undefined,
@@ -205,14 +208,23 @@ export function TickerRepairModal({ asset, open, onOpenChange }: TickerRepairMod
                     />
                   </div>
 
-                  <div className="space-y-2">
-                    <FieldLabel>Provider</FieldLabel>
-                    <Select value={provider} onChange={(event) => setProvider(event.target.value as PriceProvider)} className="h-11">
-                      <option value="yahoo">Yahoo Finance</option>
-                      <option value="alphavantage">Alpha Vantage</option>
-                      <option value="finnhub">Finnhub</option>
-                    </Select>
-                  </div>
+                  {routingInfo.kind === 'system' ? (
+                    <div className="space-y-2">
+                      <FieldLabel>System Source</FieldLabel>
+                      <div className="flex h-11 items-center rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-900 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-100">
+                        {routingInfo.label}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      <FieldLabel>Provider</FieldLabel>
+                      <Select value={provider} onChange={(event) => setProvider(event.target.value as PriceProvider)} className="h-11">
+                        <option value="yahoo">Yahoo Finance</option>
+                        <option value="alphavantage">Alpha Vantage</option>
+                        <option value="finnhub">Finnhub</option>
+                      </Select>
+                    </div>
+                  )}
 
                   <Button type="button" onClick={() => void testTicker()} disabled={isChecking || !ticker.trim()} className="h-11 md:self-end">
                     {isChecking ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Search className="mr-2 h-4 w-4" />}
@@ -427,11 +439,77 @@ function FieldLabel({ children }: React.PropsWithChildren) {
   return <label className="text-sm font-medium text-slate-900 dark:text-slate-100">{children}</label>;
 }
 
+function getRoutingInfo(asset: Asset | undefined, ticker: string) {
+  if (!asset) {
+    return {
+      kind: 'manual' as const,
+      provider: null,
+      label: 'Manual provider selection',
+      helperText: '',
+    };
+  }
+
+  const trimmedTicker = ticker.trim() || asset.ticker?.trim() || '';
+
+  if (asset.assetClass === 'Gold') {
+    return {
+      kind: 'system' as const,
+      provider: 'gold' as const,
+      label: 'Gold API',
+      helperText: 'Gold uses the shared system source automatically. No provider selection is needed here.',
+    };
+  }
+
+  if (isIndianMutualFundAsset(asset.assetClass, asset.country, trimmedTicker)) {
+    return {
+      kind: 'system' as const,
+      provider: 'amfi' as const,
+      label: 'AMFI NAV',
+      helperText: 'India mutual funds are matched through AMFI automatically using the existing fund name and ticker.',
+    };
+  }
+
+  if (isIndianStockAsset(asset.assetClass, asset.country, trimmedTicker)) {
+    return {
+      kind: 'system' as const,
+      provider: 'upstox' as const,
+      label: 'Upstox system route',
+      helperText: 'India stocks use the shared India stock route automatically, so a manual Yahoo/Alpha selection is not needed.',
+    };
+  }
+
+  if (isMassiveCandidateTicker(trimmedTicker)) {
+    return {
+      kind: 'system' as const,
+      provider: 'massive' as const,
+      label: 'Massive close data',
+      helperText: 'U.S. stocks use the shared Massive close-data route automatically and stay cached after the first daily refresh.',
+    };
+  }
+
+  if (isCanadianAutoMatchTicker(trimmedTicker, asset.country)) {
+    return {
+      kind: 'system' as const,
+      provider: 'alphavantage' as const,
+      label: 'Canada auto-match route',
+      helperText: 'Canada tickers follow the shared Canada auto-match route, so the final source is resolved by the system.',
+    };
+  }
+
+  return {
+    kind: 'manual' as const,
+    provider: null,
+    label: 'Manual provider selection',
+    helperText: '',
+  };
+}
+
 function labelForProvider(provider: ResolvedPriceProvider) {
   if (provider === 'alphavantage') return 'Alpha Vantage';
   if (provider === 'finnhub') return 'Finnhub';
   if (provider === 'massive') return 'Massive';
   if (provider === 'amfi') return 'AMFI NAV';
+  if (provider === 'upstox') return 'Upstox';
   if (provider === 'gold') return 'Gold API';
   return 'Yahoo Finance';
 }
