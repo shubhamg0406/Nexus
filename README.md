@@ -1,114 +1,123 @@
 # Nexus Portfolio
 
-Nexus Portfolio is a shared family wealth tracker built for people managing investments across India and Canada.
+Nexus Portfolio is a shared wealth tracker for families managing money across Canada and India.
 
-It helps you track your full household balance sheet in one place, including:
-- stocks
-- mutual funds
-- TFSA, RRSP, and FHSA accounts
-- bank balances and cash
-- gold
-- PF, PPF, NPS, and fixed deposits
-- real estate and other manual assets
-- liabilities such as credit cards
+It combines market-linked investments, manual assets, and liabilities in one portfolio so you can track the full household balance sheet instead of just a brokerage account.
 
-## What This App Is For
+## What It Covers
 
-Most portfolio apps are built for one person and one market.
+- Canada and India holdings in one app
+- Multiple family members in one shared portfolio
+- Stocks, ETFs, mutual funds, gold, bank balances, PF/PPF/NPS/FD, real estate, and liabilities
+- Live-priced and manual-priced assets side by side
+- Portfolio views by owner, country, asset class, and currency
 
-Nexus Portfolio is built for real families who need:
-- India and Canada holdings together
-- multiple family members in one shared portfolio
-- both live-priced and manually updated assets
-- clear views by owner, country, and currency
-- imports and exports that match how real data is stored
+## Core Features
 
-## Start Using It
+- Shared portfolio access with Google sign-in
+- Dashboard for total wealth, allocation, returns, and FX-aware views
+- Assets ledger with filters, sorting, subtotals, and bulk refresh
+- Import/export flows for Canada holdings, India holdings, and asset classes
+- Guided ticker repair and pricing controls for market-linked assets
+- System routing for different price sources instead of one-provider-only logic
 
-1. Open the live website
-2. Sign in with Google
-3. If you are an authorized member, your portfolio loads automatically
-4. Import your India and Canada holdings from `Settings`
-5. Review and manage all holdings from `Assets`
-6. Track totals, charts, and FX impact from `Dashboard`
+## Pricing Model
 
-## What You Can Do
+Nexus Portfolio uses different routes depending on the asset type.
 
-### Track Your Full Portfolio
-- manage India and Canada holdings in one place
-- track assets and liabilities together
-- view wealth by member, country, and asset class
+- India mutual funds: `AMFI`
+- India stocks: `Upstox` system route when configured
+- U.S. equities: `Massive`
+- Canada equities: close-based route with caching and queue-aware refresh handling
+- Gold: system gold pricing
+- Manual assets: no market refresh
 
-### Use Shared Family Access
-- sign in with Google
-- invite family members
-- keep one shared cloud-synced portfolio
-- see updates across devices in real time
+Bulk refresh is provider-aware:
 
-### Import And Export Easily
-- import India holdings CSV
-- import Canada holdings CSV
-- import asset classes CSV
-- export India holdings in the same format
-- export Canada holdings in the same format
+- unrestricted routes refresh immediately
+- limited routes use cached close prices and queue windows when needed
+- actionable failures are tracked separately from queued or cached rows
 
-### Work With Live Or Manual Pricing
-- use ticker-based live pricing
-- keep manual pricing for assets that should not auto-refresh
-- refresh a single row or refresh in bulk
-- fix broken tickers with a guided modal
-- apply FX conversion, unit conversion, and formulas to live prices
+## Imports and Exports
 
-### Understand Your Wealth Better
-- see combined family wealth at a glance
-- track invested amount, current value, returns, and daily change
-- switch currency views
-- review country and owner breakdowns
-- monitor FX rates and allocation views
+Inside `Settings`, you can:
 
-### Manage Data Safely
-- duplicate assets
-- edit or delete holdings
-- review failed price rows
-- migrate local data into cloud when needed
+- download blank templates
+- download sample templates with fake example data
+- import India holdings
+- import Canada holdings
+- import asset classes
+- export holdings in the same structured format
 
-## Why People Like It
+## Who This Is For
 
-- built for actual family portfolio tracking, not just stock watching
-- handles both investing and debt
-- works for India and Canada together
-- useful for households with multiple owners and multiple account types
-- flexible enough for both market-linked and manual assets
+This app is a good fit if you want:
 
-## Import Templates
+- one portfolio across countries
+- one place for both spouses or family members
+- both investments and liabilities in the same view
+- flexibility for assets that do not belong in a normal stock app
 
-The app includes downloadable templates inside `Settings`.
+## Tech Stack
 
-Supported imports:
-- India holdings
-- Canada holdings
-- asset classes
+- React
+- TypeScript
+- Vite
+- Firebase
+- Tailwind
+- TanStack Table
 
-Supported exports:
-- India holdings
-- Canada holdings
+## Local Development
 
-## For Developers
+1. Install dependencies:
 
-If you want to run the app locally:
+```bash
+npm install
+```
 
-1. `npm install`
-2. copy `.env.example` to `.env.local`
-3. add your Firebase config and any provider API keys
-4. run `npm run dev`
+2. Copy envs:
 
-Notes:
-- `NEXT_PUBLIC_*` values are exposed to the browser and should only be used for client-safe config such as Firebase app setup.
-- Sensitive provider keys should stay in server-only env vars such as `MASSIVE_API_KEY`, `FINNHUB_API_KEY`, and `ALPHA_VANTAGE_API_KEY`.
-- Optional browser-safe integrations like asset/company logos can use client env vars such as `VITE_LOGO_DEV_PUBLISHABLE_KEY`.
+```bash
+cp .env.example .env.local
+```
 
-Useful scripts:
-- `npm run dev`
-- `npm run build`
-- `npm run lint`
-- `npm run test:run`
+3. Fill in the values you need in `.env.local`
+
+4. Start the app:
+
+```bash
+npm run dev
+```
+
+## Useful Scripts
+
+```bash
+npm run dev
+npm run build
+npm run lint
+npm run test:run
+```
+
+## Environment Notes
+
+- `NEXT_PUBLIC_*` values are browser-visible and should only be used for client-safe config
+- sensitive keys should stay in server-only env vars
+- optional browser-side integrations such as logos can use client env vars like `VITE_LOGO_DEV_PUBLISHABLE_KEY`
+- keep real credentials only in `.env.local`, never in committed files
+
+## Deployment
+
+Production is currently deployed on Vercel.
+
+Live app:
+
+- [https://nexus-phi-inky.vercel.app](https://nexus-phi-inky.vercel.app)
+
+## Status
+
+Nexus Portfolio is actively being refined around:
+
+- better bulk refresh behavior
+- more reliable provider routing
+- stronger import/export workflows
+- clearer portfolio UX for real household use
