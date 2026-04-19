@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/integrations/splitwise/(.*)",
+      "destination": "/api/splitwise/$1"
+    }
+  ]
+}

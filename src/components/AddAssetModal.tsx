@@ -34,7 +34,10 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
   const [currentValue, setCurrentValue] = useState('');
   const [holdingPlatform, setHoldingPlatform] = useState('');
   const [comments, setComments] = useState('');
+  const [hiddenFromDashboard, setHiddenFromDashboard] = useState(false);
   const [preferredPriceProvider, setPreferredPriceProvider] = useState<PriceProvider>('yahoo');
+  const isSourceManagedEdit = Boolean(assetToEdit?.sourceManaged);
+  const isSplitwiseCloudEdit = Boolean(assetToEdit?.sourceManaged && assetToEdit?.connectedProvider === 'splitwise');
   const defaultPreferredProvider =
     hasConfiguredNonYahooProvider(priceProviderSettings) && priceProviderSettings.primaryProvider === 'yahoo'
       ? (priceProviderSettings.finnhubApiKey?.trim() ? 'finnhub' : 'alphavantage')
@@ -68,6 +71,7 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
       setCurrentValue(assetToEdit.currentPrice ? (assetToEdit.currentPrice * assetToEdit.quantity).toString() : '');
       setHoldingPlatform(assetToEdit.holdingPlatform || '');
       setComments(assetToEdit.comments || '');
+      setHiddenFromDashboard(Boolean(assetToEdit.hiddenFromDashboard));
       setPreferredPriceProvider(assetToEdit.preferredPriceProvider || defaultPreferredProvider);
     } else if (open && !assetToEdit) {
       resetForm();
@@ -119,6 +123,7 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
       holdingPlatform: holdingPlatform.trim() || undefined,
       comments: comments.trim() || undefined,
       preferredPriceProvider: isGoldAsset ? undefined : (hasTickerControls ? preferredPriceProvider : undefined),
+      hiddenFromDashboard,
     };
 
     if (assetToEdit) {
@@ -152,6 +157,7 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
     setCurrentValue('');
     setHoldingPlatform('');
     setComments('');
+    setHiddenFromDashboard(false);
     setPreferredPriceProvider(defaultPreferredProvider);
   };
 
@@ -165,13 +171,24 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogHeader className="space-y-1">
         <DialogTitle>{assetToEdit ? 'Edit Asset' : 'Add New Asset'}</DialogTitle>
-        <DialogDescription>Enter a full holding record. The form auto-fills the missing purchase and current values when you provide any two related numbers.</DialogDescription>
+        <DialogDescription>
+          {isSplitwiseCloudEdit
+            ? 'This row is synced from Splitwise Cloud. It is fully read-only in Nexus. Use Integrations → Splitwise to refresh or reconnect.'
+            : isSourceManagedEdit
+            ? 'This connected holding is source-managed and fully read-only in Nexus. Use Integrations to refresh or reconnect.'
+            : 'Enter a full holding record. The form auto-fills the missing purchase and current values when you provide any two related numbers.'}
+        </DialogDescription>
       </DialogHeader>
       <form onSubmit={handleSubmit} className="max-h-[82vh] space-y-3 overflow-y-auto py-1 pr-1">
+        {isSplitwiseCloudEdit ? (
+          <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-900/40 dark:bg-amber-950/20 dark:text-amber-200">
+            Splitwise Cloud rows are generated automatically. To update values, use the Splitwise integration card in Settings and click Refresh.
+          </div>
+        ) : null}
         <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,0.92fr)_minmax(0,0.9fr)_minmax(0,0.98fr)]">
           <div className="space-y-2">
             <label className="text-sm font-medium">Country</label>
-            <Select value={country} onChange={(e) => {
+            <Select value={country} disabled={isSourceManagedEdit} onChange={(e) => {
               const nextCountry = e.target.value as 'India' | 'Canada';
               setCountry(nextCountry);
               setCurrency(getDefaultCurrencyForCountry(nextCountry));
@@ -192,12 +209,12 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
           </div>
           <div className="space-y-2">
             <label className="text-sm font-medium">Purchase Date</label>
-            <Input value={purchaseDate} onChange={(e) => setPurchaseDate(e.target.value)} type="date" />
+            <Input value={purchaseDate} onChange={(e) => setPurchaseDate(e.target.value)} type="date" disabled={isSourceManagedEdit} />
           </div>
           <div className="space-y-2">
             <label className="text-sm font-medium">Asset Class</label>
             <div className="grid grid-cols-[minmax(0,180px)_minmax(0,1fr)] items-center gap-2">
-              <Select value={assetClass} onChange={(e) => setAssetClass(e.target.value)}>
+            <Select value={assetClass} onChange={(e) => setAssetClass(e.target.value)} disabled={isSourceManagedEdit}>
                 {displayClasses.map(cls => (
                   <option key={cls} value={cls}>{cls}</option>
                 ))}
@@ -217,7 +234,7 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
         <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1.15fr)_minmax(240px,0.47fr)]">
           <div className="space-y-2">
             <label className="text-sm font-medium">Owner</label>
-            <Select required value={owner} onChange={(e) => setOwner(e.target.value)}>
+            <Select required value={owner} onChange={(e) => setOwner(e.target.value)} disabled={isSourceManagedEdit}>
               {ownerOptions.map((option) => (
                 <option key={option} value={option}>
                   {option}
@@ -227,7 +244,7 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
           </div>
           <div className="space-y-2">
             <label className="text-sm font-medium">Currency</label>
-            <Select value={currency} onChange={(e) => setCurrency(e.target.value as any)}>
+            <Select value={currency} onChange={(e) => setCurrency(e.target.value as any)} disabled={isSourceManagedEdit}>
               {currencyOptions.map((option) => (
                 <option key={option} value={option}>{option}</option>
               ))}
@@ -238,15 +255,15 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
         <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
           <div className="space-y-2">
             <label className="text-sm font-medium">Asset Name</label>
-            <Input required value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Apple Inc, SBI Mutual Fund" />
+            <Input required value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Apple Inc, SBI Mutual Fund" disabled={isSourceManagedEdit} />
           </div>
           <div className="space-y-2">
             <label className="text-sm font-medium">Holding Platform</label>
-            <Input value={holdingPlatform} onChange={(e) => setHoldingPlatform(e.target.value)} placeholder="e.g. IBKR, Wealthsimple, Groww" />
+            <Input value={holdingPlatform} onChange={(e) => setHoldingPlatform(e.target.value)} placeholder="e.g. IBKR, Wealthsimple, Groww" disabled={isSourceManagedEdit} />
           </div>
           <div className="space-y-2">
             <label className="text-sm font-medium">Comments</label>
-            <Input value={comments} onChange={(e) => setComments(e.target.value)} placeholder="Optional note" />
+            <Input value={comments} onChange={(e) => setComments(e.target.value)} placeholder="Optional note" disabled={isSourceManagedEdit} />
           </div>
         </div>
 
@@ -262,7 +279,7 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
                   onChange={(e) => setTicker(e.target.value)} 
                   placeholder="e.g. NASDAQ:AAPL, NSE:RELIANCE, MUTF_IN:SBI_BLUE_CHIP" 
                   className="pr-10"
-                  disabled={!autoUpdate}
+                  disabled={!autoUpdate || isSourceManagedEdit}
                 />
                 <div className="absolute inset-y-0 right-0 pr-3 flex items-center pointer-events-none">
                   <Search className="h-4 w-4 text-slate-400" />
@@ -274,7 +291,7 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">Preferred Price Service</label>
-              <Select value={preferredPriceProvider} onChange={(e) => setPreferredPriceProvider(e.target.value as PriceProvider)} disabled={!autoUpdate}>
+              <Select value={preferredPriceProvider} onChange={(e) => setPreferredPriceProvider(e.target.value as PriceProvider)} disabled={!autoUpdate || isSourceManagedEdit}>
                 <option value="yahoo">Yahoo Finance</option>
                 <option value="alphavantage">Alpha Vantage</option>
                 <option value="finnhub">Finnhub</option>
@@ -287,6 +304,7 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
                 id="autoUpdate" 
                 checked={!autoUpdate} 
                 onChange={(e) => setAutoUpdate(!e.target.checked)}
+                disabled={isSourceManagedEdit}
                 className="h-4 w-4 rounded border-gray-300 text-[#00875A] focus:ring-[#00875A]"
               />
               <label htmlFor="autoUpdate" className="text-sm font-medium whitespace-nowrap">Manual entry</label>
@@ -302,15 +320,15 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
           <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
             <div className="space-y-2">
               <label className="text-sm font-medium">Qty</label>
-              <Input required type="number" step="any" value={quantity} onChange={(e) => setPurchaseField('quantity', e.target.value, { quantity, averagePurchasePrice, purchaseValue, setQuantity, setAveragePurchasePrice, setPurchaseValue })} placeholder="0.00" />
+              <Input required type="number" step="any" value={quantity} onChange={(e) => setPurchaseField('quantity', e.target.value, { quantity, averagePurchasePrice, purchaseValue, setQuantity, setAveragePurchasePrice, setPurchaseValue })} placeholder="0.00" disabled={isSourceManagedEdit} />
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">Average Purchase Price</label>
-              <Input required type="number" step="any" value={averagePurchasePrice} onChange={(e) => setPurchaseField('averagePurchasePrice', e.target.value, { quantity, averagePurchasePrice, purchaseValue, setQuantity, setAveragePurchasePrice, setPurchaseValue })} placeholder="0.00" />
+              <Input required type="number" step="any" value={averagePurchasePrice} onChange={(e) => setPurchaseField('averagePurchasePrice', e.target.value, { quantity, averagePurchasePrice, purchaseValue, setQuantity, setAveragePurchasePrice, setPurchaseValue })} placeholder="0.00" disabled={isSourceManagedEdit} />
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">Purchase Value</label>
-              <Input required type="number" step="any" value={purchaseValue} onChange={(e) => setPurchaseField('purchaseValue', e.target.value, { quantity, averagePurchasePrice, purchaseValue, setQuantity, setAveragePurchasePrice, setPurchaseValue })} placeholder="0.00" />
+              <Input required type="number" step="any" value={purchaseValue} onChange={(e) => setPurchaseField('purchaseValue', e.target.value, { quantity, averagePurchasePrice, purchaseValue, setQuantity, setAveragePurchasePrice, setPurchaseValue })} placeholder="0.00" disabled={isSourceManagedEdit} />
             </div>
           </div>
           <p className="mt-2 text-[11px] leading-4 text-slate-500 dark:text-slate-400">
@@ -328,11 +346,11 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
             <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
               <div className="space-y-2">
                 <label className="text-sm font-medium">Current Price</label>
-                <Input required type="number" step="any" value={currentPrice} onChange={(e) => setCurrentField('price', e.target.value, purchaseSummary.quantity, { currentPrice, currentValue, setCurrentPrice, setCurrentValue })} placeholder="0.00" />
+                <Input required type="number" step="any" value={currentPrice} onChange={(e) => setCurrentField('price', e.target.value, purchaseSummary.quantity, { currentPrice, currentValue, setCurrentPrice, setCurrentValue })} placeholder="0.00" disabled={isSourceManagedEdit} />
               </div>
               <div className="space-y-2">
                 <label className="text-sm font-medium">Current Value</label>
-                <Input required type="number" step="any" value={currentValue} onChange={(e) => setCurrentField('value', e.target.value, purchaseSummary.quantity, { currentPrice, currentValue, setCurrentPrice, setCurrentValue })} placeholder="0.00" />
+                <Input required type="number" step="any" value={currentValue} onChange={(e) => setCurrentField('value', e.target.value, purchaseSummary.quantity, { currentPrice, currentValue, setCurrentPrice, setCurrentValue })} placeholder="0.00" disabled={isSourceManagedEdit} />
               </div>
             </div>
             <p className="mt-2 text-[11px] leading-4 text-slate-500 dark:text-slate-400">
@@ -342,11 +360,26 @@ export function AddAssetModal({ open, onOpenChange, assetToEdit }: AddAssetModal
           </div>
         ) : null}
 
+        {assetToEdit ? (
+          <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 dark:border-slate-800 dark:bg-slate-900">
+            <input
+              id="hideFromDashboard"
+              type="checkbox"
+              checked={hiddenFromDashboard}
+              onChange={(event) => setHiddenFromDashboard(event.target.checked)}
+              className="h-4 w-4 rounded border-gray-300 text-[#00875A] focus:ring-[#00875A]"
+            />
+            <label htmlFor="hideFromDashboard" className="text-sm text-slate-700 dark:text-slate-200">
+              Hide this asset from dashboard totals
+            </label>
+          </div>
+        ) : null}
+
         <div className="flex justify-end space-x-2 pt-1">
           <Button type="button" variant="outline" onClick={() => onOpenChange(false)} className="rounded-full px-6">Cancel</Button>
-          <Button type="submit" className="bg-[#00875A] hover:bg-[#007A51] text-white rounded-full px-6">
-            {assetToEdit ? 'Update' : 'Create'}
-          </Button>
+              <Button type="submit" className="bg-[#00875A] hover:bg-[#007A51] text-white rounded-full px-6" disabled={isSourceManagedEdit}>
+                {assetToEdit ? 'Update' : 'Create'}
+              </Button>
         </div>
       </form>
     </Dialog>

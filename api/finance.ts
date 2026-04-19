@@ -1,4 +1,4 @@
-import { fetchAutoMatchedPrice } from '../src/lib/financeServer';
+import { fetchAutoMatchedPrice } from '../src/lib/financeServer.js';
 
 type RequestLike = {
   query: Record<string, string | string[] | undefined>;

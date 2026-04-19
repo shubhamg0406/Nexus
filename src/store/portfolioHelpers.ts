@@ -1,9 +1,13 @@
 import { DEFAULT_PRICE_PROVIDER_SETTINGS } from '../lib/api';
 import type { Asset, AssetClassDef } from './db';
 
+export type PortfolioCurrency = 'CAD' | 'INR' | 'USD';
+export type PortfolioBaseCurrency = PortfolioCurrency | 'ORIGINAL';
+
 export interface PortfolioMember {
   email: string;
   role: 'owner' | 'partner';
+  uid?: string;
 }
 
 export interface PortfolioSummary {
@@ -72,7 +76,10 @@ export function shouldHydratePersonalPortfolioFromLegacy(
 export interface PortfolioDocument {
   assets: Asset[];
   assetClasses: AssetClassDef[];
-  baseCurrency: 'CAD' | 'INR' | 'USD' | 'ORIGINAL';
+  baseCurrency: PortfolioBaseCurrency;
+  primaryCurrency?: PortfolioCurrency;
+  secondaryCurrency?: PortfolioCurrency;
+  currencySettingsVersion?: 1;
   members: PortfolioMember[];
   memberEmails: string[];
   name?: string;
@@ -81,6 +88,71 @@ export interface PortfolioDocument {
   isPersonal?: boolean;
   priceProviderSettings: typeof DEFAULT_PRICE_PROVIDER_SETTINGS;
   updatedAt?: unknown;
+}
+
+function isPortfolioCurrency(value: unknown): value is PortfolioCurrency {
+  return value === 'CAD' || value === 'INR' || value === 'USD';
+}
+
+function isBaseCurrency(value: unknown): value is PortfolioBaseCurrency {
+  return isPortfolioCurrency(value) || value === 'ORIGINAL';
+}
+
+function nextSecondaryFallback(primary: PortfolioCurrency): PortfolioCurrency {
+  if (primary !== 'USD') return 'USD';
+  return 'CAD';
+}
+
+function choosePrimaryFromDominantAssetCurrency(assets: Asset[]): PortfolioCurrency {
+  const totals: Record<PortfolioCurrency, number> = { CAD: 0, INR: 0, USD: 0 };
+  for (const asset of assets) {
+    if (!isPortfolioCurrency(asset.currency)) continue;
+    totals[asset.currency] += Math.abs(Number.isFinite(asset.costBasis) ? asset.costBasis : 0);
+  }
+
+  const ranked = (Object.entries(totals) as Array<[PortfolioCurrency, number]>)
+    .sort((left, right) => right[1] - left[1]);
+  const [candidate, candidateTotal] = ranked[0] || [];
+  if (candidate && candidateTotal > 0) return candidate;
+  return 'CAD';
+}
+
+function chooseSecondaryFromAssets(primary: PortfolioCurrency, assets: Asset[]): PortfolioCurrency {
+  const totals: Record<PortfolioCurrency, number> = { CAD: 0, INR: 0, USD: 0 };
+  for (const asset of assets) {
+    if (!isPortfolioCurrency(asset.currency) || asset.currency === primary) continue;
+    totals[asset.currency] += Math.abs(Number.isFinite(asset.costBasis) ? asset.costBasis : 0);
+  }
+
+  const ranked = (Object.entries(totals) as Array<[PortfolioCurrency, number]>)
+    .sort((left, right) => right[1] - left[1]);
+  const [candidate, candidateTotal] = ranked[0] || [];
+  if (candidate && candidateTotal > 0) return candidate;
+
+  const fallback = nextSecondaryFallback(primary);
+  if (fallback !== primary) return fallback;
+  return primary === 'CAD' ? 'INR' : 'CAD';
+}
+
+export function derivePortfolioCurrencies(data: Partial<PortfolioDocument>): {
+  primaryCurrency: PortfolioCurrency;
+  secondaryCurrency: PortfolioCurrency;
+} {
+  const assets = Array.isArray(data.assets) ? data.assets : [];
+  const baseCurrency = isBaseCurrency(data.baseCurrency) ? data.baseCurrency : 'ORIGINAL';
+  const primaryCurrency = isPortfolioCurrency(data.primaryCurrency)
+    ? data.primaryCurrency
+    : isPortfolioCurrency(baseCurrency)
+      ? baseCurrency
+      : choosePrimaryFromDominantAssetCurrency(assets);
+  const secondaryCurrency = isPortfolioCurrency(data.secondaryCurrency) && data.secondaryCurrency !== primaryCurrency
+    ? data.secondaryCurrency
+    : chooseSecondaryFromAssets(primaryCurrency, assets);
+
+  return {
+    primaryCurrency,
+    secondaryCurrency: secondaryCurrency === primaryCurrency ? chooseSecondaryFromAssets(primaryCurrency, assets) : secondaryCurrency,
+  };
 }
 
 export function getPersonalPortfolioId(uid: string) {
@@ -94,10 +166,15 @@ export function getActivePortfolioStorageKey(uid: string) {
 export function createDefaultPortfolio(email?: string | null, uid?: string | null, portfolioId?: string): PortfolioDocument {
   const normalizedEmail = email?.trim().toLowerCase();
   const isPersonal = Boolean(uid && portfolioId === getPersonalPortfolioId(uid));
+  const primaryCurrency: PortfolioCurrency = 'CAD';
+  const secondaryCurrency: PortfolioCurrency = 'USD';
   return {
     assets: [],
     assetClasses: [],
-    baseCurrency: 'ORIGINAL',
+    baseCurrency: primaryCurrency,
+    primaryCurrency,
+    secondaryCurrency,
+    currencySettingsVersion: 1,
     members: normalizedEmail ? [{ email: normalizedEmail, role: 'owner' }] : [],
     memberEmails: normalizedEmail ? [normalizedEmail] : [],
     name: isPersonal ? 'My Portfolio' : normalizedEmail ? `${normalizedEmail}'s Portfolio` : 'My Portfolio',
@@ -109,12 +186,20 @@ export function createDefaultPortfolio(email?: string | null, uid?: string | nul
 }
 
 export function normalizePortfolio(data: Partial<PortfolioDocument>): PortfolioDocument {
+  const assets = Array.isArray(data.assets) ? data.assets : [];
+  const currencySettings = derivePortfolioCurrencies({
+    ...data,
+    assets,
+  });
+  const baseCurrency = isBaseCurrency(data.baseCurrency) ? data.baseCurrency : 'ORIGINAL';
+
   return {
-    assets: Array.isArray(data.assets) ? data.assets : [],
+    assets,
     assetClasses: Array.isArray(data.assetClasses) ? data.assetClasses : [],
-    baseCurrency: data.baseCurrency === 'CAD' || data.baseCurrency === 'INR' || data.baseCurrency === 'USD' || data.baseCurrency === 'ORIGINAL'
-      ? data.baseCurrency
-      : 'ORIGINAL',
+    baseCurrency,
+    primaryCurrency: currencySettings.primaryCurrency,
+    secondaryCurrency: currencySettings.secondaryCurrency,
+    currencySettingsVersion: data.currencySettingsVersion === 1 ? 1 : undefined,
     members: Array.isArray(data.members) ? data.members : [],
     memberEmails: Array.isArray(data.memberEmails) ? data.memberEmails : Array.isArray(data.members) ? data.members.map((member) => member.email).filter(Boolean) : [],
     name: typeof data.name === 'string' ? data.name : '',

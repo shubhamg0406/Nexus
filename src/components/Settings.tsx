@@ -3,7 +3,7 @@ import Papa from 'papaparse';
 import { usePortfolio } from '../store/PortfolioContext';
 import { Button } from './ui/button';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from './ui/card';
-import { Download, Upload, Trash2, Users, PieChart, TrendingUp, Plus, RefreshCw, UserPlus, Shield, UserX } from 'lucide-react';
+import { Download, Upload, Trash2, Users, PieChart, TrendingUp, Plus, RefreshCw, UserPlus, Shield, UserX, Link2, Unlink2 } from 'lucide-react';
 import { GoogleDriveSync } from './GoogleDriveSync';
 import { Asset, AssetClassDef, getAllAssetClasses, getAllAssets, getSetting } from '../store/db';
 import { Dialog, DialogHeader, DialogTitle, DialogDescription } from './ui/dialog';
@@ -15,9 +15,13 @@ import { Input } from './ui/input';
 import { Select } from './ui/select';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './ui/table';
 import { DEFAULT_BROKER_CONNECTIONS, DEFAULT_USER_PROVIDER_OVERRIDES, type BrokerConnectionConfig, type UserBrokerConnections, type UserProviderOverrides } from '../store/userPreferences';
+import { useSplitwise } from '../store/SplitwiseContext';
+import { useConnectedAccounts } from '../store/ConnectedAccountsContext';
+import type { CurrencyAmount } from '../lib/splitwiseTypes';
+import { useAuth } from '../store/AuthContext';
 
-export type SettingsSection = 'manage-members' | 'price-providers' | 'asset-classes-overview' | 'price-updates' | 'data-management' | 'cloud-sync';
-type SettingsTab = 'access' | 'pricing' | 'structure' | 'data';
+export type SettingsSection = 'manage-members' | 'price-providers' | 'asset-classes-overview' | 'price-updates' | 'data-management' | 'cloud-sync' | 'integrations';
+type SettingsTab = 'access' | 'pricing' | 'structure' | 'data' | 'integrations';
 
 function getTabForSection(section?: SettingsSection): SettingsTab {
   switch (section) {
@@ -31,6 +35,8 @@ function getTabForSection(section?: SettingsSection): SettingsTab {
     case 'data-management':
     case 'cloud-sync':
       return 'data';
+    case 'integrations':
+      return 'integrations';
     default:
       return 'pricing';
   }
@@ -53,6 +59,9 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
     isRefreshing,
     rates,
     baseCurrency,
+    primaryCurrency,
+    secondaryCurrency,
+    setPortfolioCurrencies,
     sharedPriceProviderSettings,
     priceProviderSettings,
     updatePriceProviderSettings,
@@ -64,8 +73,30 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
     inviteMember,
     removeMember,
     currentUserRole,
+    sharedIntegrationMembers,
+    refreshSharedIntegrations,
+    disconnectMemberIntegration,
+    refreshMemberIntegration,
     setImportProgress,
   } = usePortfolio();
+  const { user } = useAuth();
+  const {
+    status: splitwiseStatus,
+    summary: splitwiseSummary,
+    loading: splitwiseLoading,
+    error: splitwiseError,
+    refresh: refreshSplitwise,
+    connect: connectSplitwise,
+    disconnect: disconnectSplitwise,
+  } = useSplitwise();
+  const {
+    upstox,
+    loading: connectedAccountsLoading,
+    error: connectedAccountsError,
+    connectUpstox,
+    refreshUpstox,
+    disconnectUpstox,
+  } = useConnectedAccounts();
   const indiaFileRef = useRef<HTMLInputElement>(null);
   const canadaFileRef = useRef<HTMLInputElement>(null);
   const classesFileRef = useRef<HTMLInputElement>(null);
@@ -84,12 +115,16 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
     localAssets: Asset[];
     localClasses: AssetClassDef[];
     localBaseCurrency: 'CAD' | 'INR' | 'USD' | 'ORIGINAL' | null;
+    localPrimaryCurrency: 'CAD' | 'INR' | 'USD' | null;
+    localSecondaryCurrency: 'CAD' | 'INR' | 'USD' | null;
     localPriceProviderSettings: PriceProviderSettings | null;
   }>({
     loading: true,
     localAssets: [],
     localClasses: [],
     localBaseCurrency: null,
+    localPrimaryCurrency: null,
+    localSecondaryCurrency: null,
     localPriceProviderSettings: null,
   });
   const [replaceConfirmText, setReplaceConfirmText] = React.useState('');
@@ -99,6 +134,96 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
   const [personalPricingMode, setPersonalPricingMode] = React.useState<'system' | 'override'>('system');
   const [brokerPricingMode, setBrokerPricingMode] = React.useState<'system' | 'override'>('system');
   const [showAdvancedProviderRouting, setShowAdvancedProviderRouting] = React.useState(false);
+  const [currencyForm, setCurrencyForm] = React.useState<{ primary: 'CAD' | 'INR' | 'USD'; secondary: 'CAD' | 'INR' | 'USD' }>({
+    primary: primaryCurrency,
+    secondary: secondaryCurrency,
+  });
+  const lastIntegrationAutoRefreshRef = React.useRef<number>(0);
+  const [teamIntegrationBusyKey, setTeamIntegrationBusyKey] = React.useState<string | null>(null);
+  const [selectedIntegrationMemberKey, setSelectedIntegrationMemberKey] = React.useState<string>('mine');
+  const canEditCurrencies = currentUserRole === 'owner';
+
+  const formatCurrencyAmount = React.useCallback((entry: CurrencyAmount) => {
+    try {
+      return new Intl.NumberFormat(undefined, {
+        style: 'currency',
+        currency: entry.currency,
+        maximumFractionDigits: 2,
+      }).format(entry.amount);
+    } catch {
+      return `${entry.amount.toFixed(2)} ${entry.currency}`;
+    }
+  }, []);
+  const formatMoney = React.useCallback((amount: number, currency: string) => {
+    try {
+      return new Intl.NumberFormat(undefined, {
+        style: 'currency',
+        currency,
+        maximumFractionDigits: 2,
+      }).format(amount);
+    } catch {
+      return `${amount.toFixed(2)} ${currency}`;
+    }
+  }, []);
+
+  const isNonZeroAmount = React.useCallback((value: number) => Math.abs(value) > 0.000001, []);
+  const splitwiseNetBalances = React.useMemo(
+    () => (splitwiseSummary?.balances.net || []).filter((entry) => Number.isFinite(entry.amount) && isNonZeroAmount(entry.amount)),
+    [isNonZeroAmount, splitwiseSummary],
+  );
+  const splitwiseOwesBalances = React.useMemo(
+    () => (splitwiseSummary?.balances.owes || []).filter((entry) => Number.isFinite(entry.amount) && isNonZeroAmount(entry.amount)),
+    [isNonZeroAmount, splitwiseSummary],
+  );
+  const splitwiseOwedBalances = React.useMemo(
+    () => (splitwiseSummary?.balances.owed || []).filter((entry) => Number.isFinite(entry.amount) && isNonZeroAmount(entry.amount)),
+    [isNonZeroAmount, splitwiseSummary],
+  );
+  const splitwiseGroupsWithBalances = React.useMemo(
+    () => (splitwiseSummary?.groups || [])
+      .map((group) => ({
+        ...group,
+        balances: group.balances.filter((entry) => Number.isFinite(entry.amount) && isNonZeroAmount(entry.amount)),
+      }))
+      .filter((group) => group.balances.length > 0),
+    [isNonZeroAmount, splitwiseSummary],
+  );
+  const splitwiseRecentExpenses = React.useMemo(
+    () => (splitwiseSummary?.recentExpenses || []).filter((expense) => {
+      const cost = Number(expense.cost);
+      return Number.isFinite(cost) && isNonZeroAmount(cost);
+    }),
+    [isNonZeroAmount, splitwiseSummary],
+  );
+
+  const splitwiseConvertedNet = React.useMemo(() => {
+    if (!splitwiseSummary) {
+      return { value: 0, missingCurrencies: [] as string[] };
+    }
+    const missingCurrencies: string[] = [];
+    const value = splitwiseNetBalances.reduce((sum, entry) => {
+      const from = String(entry.currency || '').toUpperCase();
+      if (!from || !Number.isFinite(entry.amount)) return sum;
+      if (from === primaryCurrency) return sum + entry.amount;
+      if (!rates) {
+        missingCurrencies.push(from);
+        return sum;
+      }
+      const fromRate = from === 'USD' ? 1 : rates[from];
+      const toRate = primaryCurrency === 'USD' ? 1 : rates[primaryCurrency];
+      if (!fromRate || !toRate) {
+        missingCurrencies.push(from);
+        return sum;
+      }
+      return sum + (entry.amount / fromRate) * toRate;
+    }, 0);
+    return { value, missingCurrencies: Array.from(new Set(missingCurrencies)) };
+  }, [primaryCurrency, rates, splitwiseNetBalances, splitwiseSummary]);
+
+  const formatTimestamp = React.useCallback((value?: number) => {
+    if (!value) return 'Never';
+    return new Date(value).toLocaleString();
+  }, []);
 
   React.useEffect(() => {
     setSharedProviderForm(sharedPriceProviderSettings);
@@ -121,6 +246,13 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
   }, [userBrokerConnections]);
 
   React.useEffect(() => {
+    setCurrencyForm({
+      primary: primaryCurrency,
+      secondary: secondaryCurrency,
+    });
+  }, [primaryCurrency, secondaryCurrency]);
+
+  React.useEffect(() => {
     void loadMigrationPreview();
   }, []);
 
@@ -128,6 +260,96 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
     if (!initialSection) return;
     setActiveTab(getTabForSection(initialSection));
   }, [initialSection]);
+
+  React.useEffect(() => {
+    if (activeTab !== 'integrations') return;
+    const justRanRecently = Date.now() - lastIntegrationAutoRefreshRef.current < 10 * 1000;
+    if (justRanRecently) return;
+
+    lastIntegrationAutoRefreshRef.current = Date.now();
+    void refreshSharedIntegrations();
+    if (upstox?.status === 'connected') {
+      void refreshUpstox();
+    }
+  }, [activeTab, refreshSharedIntegrations, refreshUpstox, upstox]);
+
+  const handleDisconnectTeamIntegration = React.useCallback(async (
+    provider: 'upstox' | 'splitwise',
+    targetUid: string,
+  ) => {
+    const key = `${provider}:${targetUid}`;
+    setTeamIntegrationBusyKey(key);
+    try {
+      await disconnectMemberIntegration(provider, targetUid);
+      await refreshSharedIntegrations();
+    } catch (error) {
+      setAlertDialog({
+        open: true,
+        title: 'Disconnect failed',
+        description: error instanceof Error ? error.message : 'Could not disconnect integration for this member.',
+      });
+    } finally {
+      setTeamIntegrationBusyKey(null);
+    }
+  }, [disconnectMemberIntegration, refreshSharedIntegrations]);
+
+  const handleRefreshTeamIntegration = React.useCallback(async (
+    provider: 'upstox' | 'splitwise',
+    targetUid: string,
+  ) => {
+    const key = `refresh:${provider}:${targetUid}`;
+    setTeamIntegrationBusyKey(key);
+    try {
+      await refreshMemberIntegration(provider, targetUid);
+      await refreshSharedIntegrations();
+    } catch (error) {
+      setAlertDialog({
+        open: true,
+        title: 'Refresh failed',
+        description: error instanceof Error ? error.message : 'Could not refresh integration for this member.',
+      });
+    } finally {
+      setTeamIntegrationBusyKey(null);
+    }
+  }, [refreshMemberIntegration, refreshSharedIntegrations]);
+
+  const integrationMembersView = React.useMemo(() => {
+    const byUid = new Map(sharedIntegrationMembers.map((entry) => [entry.member.uid, entry]));
+    return members.map((member, index) => {
+      const memberEmail = (member.email || '').trim().toLowerCase();
+      const memberUid = member.uid || '';
+      const sharedEntry = memberUid ? byUid.get(memberUid) : undefined;
+      const key = memberUid ? `uid:${memberUid}` : `email:${memberEmail || index}`;
+      const label = memberEmail || `Member ${index + 1}`;
+      return {
+        key,
+        email: memberEmail,
+        uid: memberUid || null,
+        role: member.role,
+        label,
+        sharedEntry: sharedEntry || null,
+      };
+    });
+  }, [members, sharedIntegrationMembers]);
+
+  React.useEffect(() => {
+    if (integrationMembersView.length === 0) {
+      setSelectedIntegrationMemberKey('mine');
+      return;
+    }
+    if (!integrationMembersView.some((member) => member.key === selectedIntegrationMemberKey)) {
+      const mine = integrationMembersView.find((member) => member.uid === user?.uid);
+      setSelectedIntegrationMemberKey(mine?.key || integrationMembersView[0].key);
+    }
+  }, [integrationMembersView, selectedIntegrationMemberKey, user?.uid]);
+
+  const selectedIntegrationMember = React.useMemo(
+    () => integrationMembersView.find((member) => member.key === selectedIntegrationMemberKey) || integrationMembersView[0] || null,
+    [integrationMembersView, selectedIntegrationMemberKey],
+  );
+  const selectedSharedIntegration = selectedIntegrationMember?.sharedEntry || null;
+  const selectedMemberIsSelf = selectedIntegrationMember?.uid === user?.uid;
+  const selectedMemberCanBeManagedByOwner = Boolean(selectedIntegrationMember?.uid && !selectedMemberIsSelf && currentUserRole === 'owner');
 
   const downloadIndiaTemplate = () => {
     const csv = "Purchase Date,Owner,Holding Name,Ticker,Type,Holding Platform,Comments,Qty,Average Purchase Price,Purchase Value,Current Price,Current Value";
@@ -734,6 +956,24 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
     setAlertDialog({ open: true, title: 'Saved', description: 'Broker connection details are stored on this device.' });
   };
 
+  const saveCurrencyPreferences = async () => {
+    if (!canEditCurrencies) {
+      setAlertDialog({
+        open: true,
+        title: 'Owner Access Required',
+        description: 'Only portfolio owners can update primary and secondary currencies.',
+      });
+      return;
+    }
+    const primary = currencyForm.primary;
+    const secondary = currencyForm.secondary === primary
+      ? (primary === 'USD' ? 'CAD' : 'USD')
+      : currencyForm.secondary;
+    await setPortfolioCurrencies(primary, secondary);
+    setCurrencyForm({ primary, secondary });
+    setAlertDialog({ open: true, title: 'Saved', description: `Primary currency set to ${primary} and secondary currency set to ${secondary}.` });
+  };
+
   const saveSystemBrokerRouting = async () => {
     await updateUserBrokerConnections({
       ...brokerForm,
@@ -755,10 +995,12 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
   const loadMigrationPreview = async () => {
     setMigrationPreview((current) => ({ ...current, loading: true }));
     try {
-      const [localAssets, localClasses, localBaseCurrency, localProviderSettings] = await Promise.all([
+      const [localAssets, localClasses, localBaseCurrency, localPrimaryCurrency, localSecondaryCurrency, localProviderSettings] = await Promise.all([
         getAllAssets(),
         getAllAssetClasses(),
         getSetting<'CAD' | 'INR' | 'USD' | 'ORIGINAL'>('baseCurrency'),
+        getSetting<'CAD' | 'INR' | 'USD'>('primaryCurrency'),
+        getSetting<'CAD' | 'INR' | 'USD'>('secondaryCurrency'),
         getSetting<PriceProviderSettings>('priceProviderSettings'),
       ]);
 
@@ -767,6 +1009,8 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
         localAssets,
         localClasses,
         localBaseCurrency: localBaseCurrency || null,
+        localPrimaryCurrency: localPrimaryCurrency || null,
+        localSecondaryCurrency: localSecondaryCurrency || null,
         localPriceProviderSettings: localProviderSettings || null,
       });
     } catch {
@@ -775,6 +1019,8 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
         localAssets: [],
         localClasses: [],
         localBaseCurrency: null,
+        localPrimaryCurrency: null,
+        localSecondaryCurrency: null,
         localPriceProviderSettings: null,
       });
     }
@@ -786,6 +1032,8 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
     const sourceAssets = migrationSource === 'screen' ? assets : migrationPreview.localAssets;
     const sourceAssetClasses = migrationSource === 'screen' ? assetClasses : migrationPreview.localClasses;
     const sourceBaseCurrency = migrationSource === 'screen' ? baseCurrency : migrationPreview.localBaseCurrency || undefined;
+    const sourcePrimaryCurrency = migrationSource === 'screen' ? primaryCurrency : migrationPreview.localPrimaryCurrency || undefined;
+    const sourceSecondaryCurrency = migrationSource === 'screen' ? secondaryCurrency : migrationPreview.localSecondaryCurrency || undefined;
     const sourcePriceProviderSettings = migrationSource === 'screen'
       ? sharedPriceProviderSettings
       : migrationPreview.localPriceProviderSettings || undefined;
@@ -794,6 +1042,8 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
         assets: sourceAssets,
         assetClasses: sourceAssetClasses,
         baseCurrency: sourceBaseCurrency,
+        primaryCurrency: sourcePrimaryCurrency,
+        secondaryCurrency: sourceSecondaryCurrency,
         priceProviderSettings: sourcePriceProviderSettings,
       });
       setReplaceConfirmText('');
@@ -839,6 +1089,7 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
     { id: 'pricing', label: 'Pricing', description: 'Providers and brokers' },
     { id: 'structure', label: 'Structure', description: 'Classes and organization' },
     { id: 'data', label: 'Data', description: 'Imports, sync, migration' },
+    { id: 'integrations', label: 'Integrations', description: 'Connected accounts' },
   ];
 
   return (
@@ -849,7 +1100,7 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
           <h1 className="text-4xl font-extrabold tracking-tight text-slate-900 dark:text-white mb-2">Settings</h1>
             <p className="text-lg text-slate-500 dark:text-slate-400">Configure your portfolio tracker without digging through one long page.</p>
           </div>
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
             <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm dark:border-slate-800 dark:bg-slate-950">
               <div className="text-slate-500 dark:text-slate-400">Members</div>
               <div className="mt-1 text-xl font-semibold text-slate-900 dark:text-white">{members.length}</div>
@@ -863,14 +1114,18 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
               <div className="mt-1 text-xl font-semibold text-slate-900 dark:text-white">{allAssetClasses.length}</div>
             </div>
             <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm dark:border-slate-800 dark:bg-slate-950">
-              <div className="text-slate-500 dark:text-slate-400">Base Currency</div>
-              <div className="mt-1 text-xl font-semibold text-slate-900 dark:text-white">{baseCurrency}</div>
+              <div className="text-slate-500 dark:text-slate-400">Primary Currency</div>
+              <div className="mt-1 text-xl font-semibold text-slate-900 dark:text-white">{primaryCurrency}</div>
+            </div>
+            <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm dark:border-slate-800 dark:bg-slate-950">
+              <div className="text-slate-500 dark:text-slate-400">Secondary Currency</div>
+              <div className="mt-1 text-xl font-semibold text-slate-900 dark:text-white">{secondaryCurrency}</div>
             </div>
           </div>
         </div>
 
         <div className="rounded-3xl border border-slate-200 bg-slate-50 p-2 shadow-sm dark:border-slate-800 dark:bg-slate-900">
-          <div className="grid gap-2 md:grid-cols-4">
+          <div className="grid gap-2 md:grid-cols-5">
             {tabItems.map((tab) => {
               const isActive = activeTab === tab.id;
               return (
@@ -1003,6 +1258,56 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
           <CardDescription>Set up each asset type in one pass. For every route, users can stay on the system setup or override with their own credentials on this device.</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
+          <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-semibold text-slate-900 dark:text-white">Portfolio Currency Preferences</h3>
+                <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">Primary is your canonical tracking currency; secondary is your alternate comparison currency.</p>
+              </div>
+              <div className="rounded-full bg-white px-3 py-1 text-xs font-semibold uppercase tracking-wider text-slate-600 dark:bg-slate-950 dark:text-slate-300">
+                Legacy base: {baseCurrency}
+              </div>
+            </div>
+            <div className="grid gap-4 md:grid-cols-2">
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Primary Currency</label>
+                <Select
+                  value={currencyForm.primary}
+                  onChange={(event) => setCurrencyForm((current) => ({ ...current, primary: event.target.value as 'CAD' | 'INR' | 'USD' }))}
+                  disabled={!canEditCurrencies}
+                >
+                  <option value="CAD">CAD</option>
+                  <option value="USD">USD</option>
+                  <option value="INR">INR</option>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Secondary Currency</label>
+                <Select
+                  value={currencyForm.secondary}
+                  onChange={(event) => setCurrencyForm((current) => ({ ...current, secondary: event.target.value as 'CAD' | 'INR' | 'USD' }))}
+                  disabled={!canEditCurrencies}
+                >
+                  <option value="CAD">CAD</option>
+                  <option value="USD">USD</option>
+                  <option value="INR">INR</option>
+                </Select>
+              </div>
+            </div>
+            <div className="mt-4 flex justify-end">
+              <Button
+                className="rounded-full bg-[#00875A] text-white hover:bg-[#007A51]"
+                onClick={() => void saveCurrencyPreferences()}
+                disabled={!canEditCurrencies}
+              >
+                Save Currency Preferences
+              </Button>
+            </div>
+            {!canEditCurrencies && (
+              <p className="mt-3 text-sm text-slate-500">Only portfolio owners can update currency preferences.</p>
+            )}
+          </div>
+
           <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-950">
             <Table className="[&_td]:py-3 [&_th]:py-3">
               <TableHeader>
@@ -1476,7 +1781,9 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
               <div className="space-y-2 text-sm text-slate-600 dark:text-slate-300">
                 <div>Assets: <span className="font-semibold text-slate-900 dark:text-white">{assets.length}</span></div>
                 <div>Asset Classes: <span className="font-semibold text-slate-900 dark:text-white">{assetClasses.length}</span></div>
-                <div>Base Currency: <span className="font-semibold text-slate-900 dark:text-white">{baseCurrency}</span></div>
+                <div>Primary Currency: <span className="font-semibold text-slate-900 dark:text-white">{primaryCurrency}</span></div>
+                <div>Secondary Currency: <span className="font-semibold text-slate-900 dark:text-white">{secondaryCurrency}</span></div>
+                <div>Legacy Base Currency: <span className="font-semibold text-slate-900 dark:text-white">{baseCurrency}</span></div>
                 <div>Primary Provider: <span className="font-semibold text-slate-900 dark:text-white">{sharedPriceProviderSettings.primaryProvider}</span></div>
               </div>
             </div>
@@ -1488,14 +1795,16 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
                 <div className="space-y-2 text-sm text-slate-600 dark:text-slate-300">
                   <div>Assets: <span className="font-semibold text-slate-900 dark:text-white">{migrationPreview.localAssets.length}</span></div>
                   <div>Asset Classes: <span className="font-semibold text-slate-900 dark:text-white">{migrationPreview.localClasses.length}</span></div>
-                  <div>Base Currency: <span className="font-semibold text-slate-900 dark:text-white">{migrationPreview.localBaseCurrency || 'Not stored locally'}</span></div>
+                  <div>Primary Currency: <span className="font-semibold text-slate-900 dark:text-white">{migrationPreview.localPrimaryCurrency || 'Not stored locally'}</span></div>
+                  <div>Secondary Currency: <span className="font-semibold text-slate-900 dark:text-white">{migrationPreview.localSecondaryCurrency || 'Not stored locally'}</span></div>
+                  <div>Legacy Base Currency: <span className="font-semibold text-slate-900 dark:text-white">{migrationPreview.localBaseCurrency || 'Not stored locally'}</span></div>
                   <div>Primary Provider: <span className="font-semibold text-slate-900 dark:text-white">{migrationPreview.localPriceProviderSettings?.primaryProvider || 'Not stored locally'}</span></div>
                 </div>
               )}
             </div>
           </div>
           <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200">
-            This is a full replacement. It overwrites cloud assets, asset classes, base currency, and price-provider settings with the selected source. Member access stays intact so you do not lose login access.
+            This is a full replacement. It overwrites cloud assets, asset classes, primary/secondary currency settings, legacy base currency alias, and price-provider settings with the selected source. Member access stays intact so you do not lose login access.
           </div>
           <div className="flex flex-wrap gap-3">
             <Button variant="outline" onClick={() => void loadMigrationPreview()}>
@@ -1638,6 +1947,516 @@ export function Settings({ initialSection }: { initialSection?: SettingsSection 
         </CardContent>
       </Card>
       </div>
+      )}
+
+      {activeTab === 'integrations' && (
+        <div id="integrations" className="space-y-6">
+          <div className="mb-6">
+            <h2 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white">Integrations</h2>
+            <p className="text-slate-500 dark:text-slate-400">Connect cloud accounts to enrich Nexus with external financial context.</p>
+          </div>
+
+          <Card className="border-none shadow-sm rounded-2xl">
+            <CardHeader>
+              <div className="flex items-center gap-2">
+                <Link2 className="h-5 w-5 text-slate-700 dark:text-slate-300" />
+                <CardTitle>Connected Accounts</CardTitle>
+              </div>
+              <CardDescription>Cloud-backed, read-only broker sync. Connected holdings are source-managed and synced across devices.</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-5">
+              <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-950">
+                <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-3">
+                      <span className={`inline-flex rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-wide ${
+                        upstox?.status === 'connected'
+                          ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-200'
+                          : upstox?.status === 'syncing' || upstox?.status === 'connecting'
+                            ? 'bg-sky-100 text-sky-800 dark:bg-sky-950/40 dark:text-sky-200'
+                            : upstox?.status === 'revoked'
+                              ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:text-amber-200'
+                              : upstox?.status === 'error'
+                                ? 'bg-rose-100 text-rose-800 dark:bg-rose-950/40 dark:text-rose-200'
+                                : 'bg-slate-100 text-slate-700 dark:bg-slate-900 dark:text-slate-300'
+                      }`}>
+                        {upstox?.status || 'disconnected'}
+                      </span>
+                      <span className="text-xs text-slate-500 dark:text-slate-400">
+                        Last synced: {formatTimestamp(upstox?.lastSyncAt)}
+                      </span>
+                    </div>
+
+                    <div>
+                      <div className="text-sm font-semibold text-slate-900 dark:text-white">Upstox</div>
+                      <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
+                        {upstox?.status === 'connected'
+                          ? `${upstox.displayName || 'Upstox account'} is connected. Holdings and positions are synced as read-only snapshots.`
+                          : 'Connect Upstox to sync holdings and positions into your cloud-backed Nexus account. Nexus redirects you to Upstox for secure login/consent.'}
+                      </p>
+                    </div>
+
+                    {connectedAccountsError ? (
+                      <p className="text-sm text-rose-700 dark:text-rose-300">{connectedAccountsError}</p>
+                    ) : null}
+                  </div>
+
+                  <div className="flex flex-wrap gap-2">
+                    {!upstox || upstox.status === 'disconnected' || upstox.status === 'error' || upstox.status === 'revoked' ? (
+                      <Button onClick={connectUpstox} disabled={connectedAccountsLoading} className="rounded-full bg-[#00875A] text-white hover:bg-[#007A51]">
+                        Connect Upstox
+                      </Button>
+                    ) : null}
+
+                    {upstox?.status === 'connected' ? (
+                      <>
+                        <Button variant="outline" onClick={() => void refreshUpstox()} disabled={connectedAccountsLoading} className="rounded-full">
+                          <RefreshCw className={`mr-2 h-4 w-4 ${connectedAccountsLoading ? 'animate-spin' : ''}`} />
+                          Refresh
+                        </Button>
+                        <Button variant="outline" onClick={connectUpstox} disabled={connectedAccountsLoading} className="rounded-full">
+                          Reconnect
+                        </Button>
+                        <Button variant="outline" onClick={() => void disconnectUpstox()} disabled={connectedAccountsLoading} className="rounded-full">
+                          <Unlink2 className="mr-2 h-4 w-4" />
+                          Disconnect
+                        </Button>
+                      </>
+                    ) : null}
+                  </div>
+                </div>
+              </div>
+
+              {upstox?.status === 'connected' ? (
+                <div className="space-y-4">
+                  <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                    <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900">
+                      <div className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">Connected Holdings</div>
+                      <div className="mt-2 text-2xl font-semibold text-slate-900 dark:text-white">{upstox.holdingsSummary.totalHoldingsCount}</div>
+                    </div>
+                    <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900">
+                      <div className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">Open Positions</div>
+                      <div className="mt-2 text-2xl font-semibold text-slate-900 dark:text-white">{upstox.holdingsSummary.totalPositionsCount}</div>
+                    </div>
+                    <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900">
+                      <div className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">Connected Accounts</div>
+                      <div className="mt-2 text-2xl font-semibold text-slate-900 dark:text-white">{upstox.accounts.length}</div>
+                    </div>
+                    <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900">
+                      <div className="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">Recent Sync</div>
+                      <div className="mt-2 text-sm font-semibold text-slate-900 dark:text-white">{upstox.syncRuns?.[0]?.status || 'n/a'}</div>
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-950">
+                    <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Market Value By Currency</h3>
+                    <div className="mt-3 space-y-2">
+                      {upstox.holdingsSummary.totalMarketValueByCurrency.length > 0 ? (
+                        upstox.holdingsSummary.totalMarketValueByCurrency.map((entry) => (
+                          <div key={entry.currency} className="flex items-center justify-between text-sm">
+                            <span className="text-slate-500 dark:text-slate-400">{entry.currency}</span>
+                            <span className="font-semibold text-slate-900 dark:text-white">{entry.value.toLocaleString(undefined, { maximumFractionDigits: 2 })}</span>
+                          </div>
+                        ))
+                      ) : (
+                        <p className="text-sm text-slate-500 dark:text-slate-400">No market value returned yet.</p>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-950">
+                    <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Accounts</h3>
+                    <div className="mt-3 space-y-2">
+                      {upstox.accounts.length > 0 ? upstox.accounts.map((account) => (
+                        <div key={account.id} className="flex items-center justify-between gap-3 rounded-xl border border-slate-100 px-3 py-2 text-sm dark:border-slate-800">
+                          <div>
+                            <div className="font-medium text-slate-900 dark:text-white">{account.accountName}</div>
+                            <div className="text-xs text-slate-500 dark:text-slate-400">{account.currency}</div>
+                          </div>
+                          <div className="text-right">
+                            <div className="font-semibold text-slate-900 dark:text-white">
+                              {(account.marketValue || 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                            </div>
+                            <div className="text-xs text-slate-500 dark:text-slate-400">Market value</div>
+                          </div>
+                        </div>
+                      )) : (
+                        <p className="text-sm text-slate-500 dark:text-slate-400">No account snapshots available yet.</p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ) : null}
+
+              <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-950">
+                <div className="flex items-center justify-between gap-3">
+                  <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Member Integration Views</h3>
+                  <Button variant="outline" className="rounded-full" onClick={() => void refreshSharedIntegrations()} disabled={connectedAccountsLoading}>
+                    <RefreshCw className="mr-2 h-4 w-4" />
+                    Refresh team
+                  </Button>
+                </div>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {integrationMembersView.map((member) => (
+                    <Button
+                      key={`member-tab-${member.key}`}
+                      variant={selectedIntegrationMember?.key === member.key ? 'default' : 'outline'}
+                      className={`rounded-full ${selectedIntegrationMember?.key === member.key ? 'bg-[#00875A] text-white hover:bg-[#007A51]' : ''}`}
+                      onClick={() => setSelectedIntegrationMemberKey(member.key)}
+                    >
+                      {member.label}
+                      {member.uid === user?.uid ? ' (you)' : ''}
+                    </Button>
+                  ))}
+                </div>
+
+                {selectedIntegrationMember ? (
+                  <div className="mt-4 space-y-3 rounded-xl border border-slate-100 p-3 dark:border-slate-800">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <div className="text-sm font-semibold text-slate-900 dark:text-white">
+                          {selectedIntegrationMember.label}
+                          {selectedMemberIsSelf ? ' (you)' : ''}
+                        </div>
+                        <div className="text-xs text-slate-500 dark:text-slate-400">{selectedIntegrationMember.role}</div>
+                      </div>
+                    </div>
+
+                    {!selectedIntegrationMember.uid ? (
+                      <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900/40 dark:bg-amber-950/20 dark:text-amber-200">
+                        This member has not logged into Nexus yet. Ask them to sign in once to activate personal integration setup.
+                      </div>
+                    ) : (
+                      <>
+                        <div className="flex flex-wrap items-center gap-2 text-xs">
+                          <span className="rounded-full bg-slate-100 px-2.5 py-1 font-medium text-slate-700 dark:bg-slate-900 dark:text-slate-300">
+                            Upstox: {selectedSharedIntegration?.upstox.status.status || 'disconnected'}
+                          </span>
+                          <span className="rounded-full bg-slate-100 px-2.5 py-1 font-medium text-slate-700 dark:bg-slate-900 dark:text-slate-300">
+                            Splitwise: {selectedSharedIntegration?.splitwise.status.status || 'disconnected'}
+                          </span>
+                        </div>
+
+                        <div className="flex flex-wrap gap-2">
+                          {selectedMemberIsSelf ? (
+                            <>
+                              <Button variant="outline" className="rounded-full" onClick={() => void refreshUpstox()} disabled={connectedAccountsLoading}>
+                                <RefreshCw className="mr-2 h-4 w-4" />
+                                Refresh My Upstox
+                              </Button>
+                              <Button variant="outline" className="rounded-full" onClick={() => void refreshSplitwise()} disabled={splitwiseLoading}>
+                                <RefreshCw className="mr-2 h-4 w-4" />
+                                Refresh My Splitwise
+                              </Button>
+                            </>
+                          ) : null}
+
+                          {selectedMemberCanBeManagedByOwner && selectedIntegrationMember.uid ? (
+                            <>
+                              <Button
+                                variant="outline"
+                                className="rounded-full"
+                                disabled={Boolean(teamIntegrationBusyKey)}
+                                onClick={() => void handleRefreshTeamIntegration('upstox', selectedIntegrationMember.uid!)}
+                              >
+                                Refresh Upstox
+                              </Button>
+                              <Button
+                                variant="outline"
+                                className="rounded-full"
+                                disabled={Boolean(teamIntegrationBusyKey)}
+                                onClick={() => void handleRefreshTeamIntegration('splitwise', selectedIntegrationMember.uid!)}
+                              >
+                                Refresh Splitwise
+                              </Button>
+                              <Button
+                                variant="outline"
+                                className="rounded-full"
+                                disabled={Boolean(teamIntegrationBusyKey)}
+                                onClick={() => void handleDisconnectTeamIntegration('upstox', selectedIntegrationMember.uid!)}
+                              >
+                                Disconnect Upstox
+                              </Button>
+                              <Button
+                                variant="outline"
+                                className="rounded-full"
+                                disabled={Boolean(teamIntegrationBusyKey)}
+                                onClick={() => void handleDisconnectTeamIntegration('splitwise', selectedIntegrationMember.uid!)}
+                              >
+                                Disconnect Splitwise
+                              </Button>
+                            </>
+                          ) : null}
+                        </div>
+
+                        {!selectedMemberIsSelf ? (
+                          <p className="text-xs text-slate-500 dark:text-slate-400">
+                            Connecting/reconnecting for this member still requires their own login credentials and consent.
+                          </p>
+                        ) : null}
+                      </>
+                    )}
+                  </div>
+                ) : null}
+
+                <div className="mt-2">
+                  {integrationMembersView.length === 0 ? (
+                    <p className="text-sm text-slate-500 dark:text-slate-400">No portfolio members found yet.</p>
+                  ) : null}
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-dashed border-slate-300 bg-slate-50 p-4 text-sm text-slate-600 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
+                <div className="font-semibold text-slate-800 dark:text-slate-100">Future integrations</div>
+                <div className="mt-2">Groww: Requires paid Groww Trading API subscription; not enabled in this build.</div>
+                <div className="mt-1">Canada Bank Aggregation: Planned; no live free production-safe aggregator is enabled in this build.</div>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card className="border-none shadow-sm rounded-2xl">
+            <CardHeader>
+              <div className="flex items-center gap-2">
+                <Link2 className="h-5 w-5 text-slate-700 dark:text-slate-300" />
+                <CardTitle>Splitwise</CardTitle>
+              </div>
+              <CardDescription>Connect your Splitwise account to show shared-expense balances in Nexus.</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-5">
+              <div className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-950">
+                <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-3">
+                      <span className={`inline-flex rounded-full px-3 py-1 text-xs font-semibold uppercase tracking-wide ${
+                        splitwiseStatus === 'connected'
+                          ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-200'
+                          : splitwiseStatus === 'reconnect_needed'
+                            ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:text-amber-200'
+                          : splitwiseStatus === 'revoked'
+                            ? 'bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:text-amber-200'
+                            : splitwiseStatus === 'error'
+                              ? 'bg-rose-100 text-rose-800 dark:bg-rose-950/40 dark:text-rose-200'
+                              : 'bg-slate-100 text-slate-700 dark:bg-slate-900 dark:text-slate-300'
+                      }`}>
+                        {splitwiseStatus}
+                      </span>
+                      {splitwiseSummary?.lastSyncAt ? (
+                        <span className="text-xs text-slate-500 dark:text-slate-400">
+                          Last synced: {formatTimestamp(splitwiseSummary.lastSyncAt)}
+                        </span>
+                      ) : null}
+                    </div>
+
+                    {splitwiseSummary?.profile ? (
+                      <div className="flex items-center gap-3">
+                        {splitwiseSummary.profile.pictureUrl ? (
+                          <img
+                            src={splitwiseSummary.profile.pictureUrl}
+                            alt="Splitwise profile"
+                            className="h-10 w-10 rounded-full border border-slate-200 object-cover dark:border-slate-700"
+                          />
+                        ) : (
+                          <div className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-slate-100 text-sm font-semibold text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
+                            {(splitwiseSummary.profile.firstName || 'S').charAt(0).toUpperCase()}
+                          </div>
+                        )}
+                        <div>
+                          <div className="text-sm font-semibold text-slate-900 dark:text-white">
+                            {[splitwiseSummary.profile.firstName, splitwiseSummary.profile.lastName].filter(Boolean).join(' ') || 'Splitwise User'}
+                          </div>
+                          <div className="text-xs text-slate-500 dark:text-slate-400">{splitwiseSummary.profile.email || 'No email available'}</div>
+                        </div>
+                      </div>
+                    ) : (
+                      <p className="text-sm text-slate-600 dark:text-slate-300">
+                        Connect Splitwise to display balances by currency, group-level balances, and recent expenses in this shared cloud account.
+                      </p>
+                    )}
+
+                    {splitwiseError ? (
+                      <p className="text-sm text-rose-700 dark:text-rose-300">{splitwiseError}</p>
+                    ) : null}
+
+                    {splitwiseStatus === 'connecting' ? (
+                      <p className="flex items-center gap-2 text-sm text-slate-600 dark:text-slate-300">
+                        <RefreshCw className="h-4 w-4 animate-spin" />
+                        Opening Splitwise authorization...
+                      </p>
+                    ) : null}
+                  </div>
+
+                  <div className="flex flex-wrap gap-2">
+                    {(splitwiseStatus === 'disconnected' || splitwiseStatus === 'error' || splitwiseStatus === 'revoked' || splitwiseStatus === 'reconnect_needed') ? (
+                      <Button
+                        onClick={connectSplitwise}
+                        disabled={splitwiseLoading}
+                        className="rounded-full bg-[#00875A] text-white hover:bg-[#007A51]"
+                      >
+                        Connect Splitwise
+                      </Button>
+                    ) : null}
+
+                    {splitwiseStatus === 'connecting' ? (
+                      <Button disabled className="rounded-full bg-[#00875A] text-white">
+                        <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
+                        Connecting...
+                      </Button>
+                    ) : null}
+
+                    {splitwiseStatus === 'connected' ? (
+                      <>
+                        <Button variant="outline" onClick={() => void refreshSplitwise()} disabled={splitwiseLoading} className="rounded-full">
+                          <RefreshCw className={`mr-2 h-4 w-4 ${splitwiseLoading ? 'animate-spin' : ''}`} />
+                          Refresh
+                        </Button>
+                        <Button variant="outline" onClick={connectSplitwise} disabled={splitwiseLoading} className="rounded-full">
+                          Reconnect
+                        </Button>
+                        <Button variant="outline" onClick={() => void disconnectSplitwise()} disabled={splitwiseLoading} className="rounded-full">
+                          <Unlink2 className="mr-2 h-4 w-4" />
+                          Disconnect
+                        </Button>
+                      </>
+                    ) : null}
+                  </div>
+                </div>
+              </div>
+
+              {splitwiseStatus === 'connected' && splitwiseSummary ? (
+                <details className="rounded-2xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-950">
+                  <summary className="cursor-pointer list-none px-4 py-3 text-sm font-semibold text-slate-900 dark:text-white [&::-webkit-details-marker]:hidden">
+                    Splitwise details (click to expand)
+                  </summary>
+                  <div className="space-y-6 border-t border-slate-200 p-4 dark:border-slate-800">
+                    <div>
+                      <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Converted Net (Primary)</h3>
+                      <div className="mt-3 grid gap-4 md:grid-cols-2">
+                        <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900">
+                          <div className="text-sm font-semibold text-slate-900 dark:text-white">Net in {primaryCurrency}</div>
+                          <div className="mt-2 text-2xl font-bold text-slate-900 dark:text-white">
+                            {formatMoney(splitwiseConvertedNet.value, primaryCurrency)}
+                          </div>
+                          {splitwiseConvertedNet.missingCurrencies.length > 0 ? (
+                            <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">
+                              Missing FX for {splitwiseConvertedNet.missingCurrencies.join(', ')} {'->'} {primaryCurrency}. Those amounts are excluded.
+                            </p>
+                          ) : (
+                            <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
+                              All Splitwise net balances were converted to your primary currency.
+                            </p>
+                          )}
+                        </div>
+                        <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900">
+                          <div className="text-sm font-semibold text-slate-900 dark:text-white">Original Breakdown</div>
+                          <div className="mt-2 space-y-1">
+                            {splitwiseNetBalances.length > 0 ? (
+                              splitwiseNetBalances.map((entry) => (
+                                <div key={`breakdown-${entry.currency}`} className="flex items-center justify-between text-sm">
+                                  <span className="text-slate-500 dark:text-slate-400">{entry.currency}</span>
+                                  <span className="font-semibold text-slate-900 dark:text-white">{formatCurrencyAmount(entry)}</span>
+                                </div>
+                              ))
+                            ) : (
+                              <p className="text-sm text-slate-500 dark:text-slate-400">No non-zero balances available.</p>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div>
+                      <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Splitwise Balances (Original)</h3>
+                      <div className="mt-3 grid gap-4 md:grid-cols-3">
+                        {[
+                          ['Owes', splitwiseOwesBalances],
+                          ['Owed', splitwiseOwedBalances],
+                          ['Net', splitwiseNetBalances],
+                        ].map(([title, values]) => (
+                          <div key={title} className="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-800 dark:bg-slate-900">
+                            <div className="text-sm font-semibold text-slate-900 dark:text-white">{title}</div>
+                            <div className="mt-2 space-y-1">
+                              {(values as CurrencyAmount[]).length > 0 ? (
+                                (values as CurrencyAmount[]).map((entry) => (
+                                  <div key={`${title}-${entry.currency}`} className="flex items-center justify-between text-sm">
+                                    <span className="text-slate-500 dark:text-slate-400">{entry.currency}</span>
+                                    <span className="font-semibold text-slate-900 dark:text-white">{formatCurrencyAmount(entry)}</span>
+                                  </div>
+                                ))
+                              ) : (
+                                <p className="text-sm text-slate-500 dark:text-slate-400">No non-zero balances in this section.</p>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div>
+                      <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Groups</h3>
+                      <div className="mt-3 grid gap-4 md:grid-cols-2">
+                        {splitwiseGroupsWithBalances.length > 0 ? (
+                          splitwiseGroupsWithBalances.map((group) => (
+                            <div key={group.id} className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-950">
+                              <div className="flex items-start justify-between gap-3">
+                                <div>
+                                  <div className="text-sm font-semibold text-slate-900 dark:text-white">{group.name}</div>
+                                  <div className="text-xs text-slate-500 dark:text-slate-400">Members: {group.memberCount}</div>
+                                </div>
+                                <div className="text-xs text-slate-500 dark:text-slate-400">
+                                  {group.updatedAt ? new Date(group.updatedAt).toLocaleDateString() : 'No update time'}
+                                </div>
+                              </div>
+                              <div className="mt-3 space-y-1">
+                                {group.balances.map((entry) => (
+                                  <div key={`${group.id}-${entry.currency}`} className="flex items-center justify-between text-sm">
+                                    <span className="text-slate-500 dark:text-slate-400">{entry.currency}</span>
+                                    <span className="font-semibold text-slate-900 dark:text-white">{formatCurrencyAmount(entry)}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-500 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-400">
+                            No non-zero group balances available.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    <div>
+                      <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Recent Expenses</h3>
+                      <div className="mt-3 space-y-2">
+                        {splitwiseRecentExpenses.length > 0 ? (
+                          splitwiseRecentExpenses.map((expense) => (
+                            <div key={expense.id} className="rounded-2xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-950">
+                              <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                                <div>
+                                  <div className="text-sm font-semibold text-slate-900 dark:text-white">{expense.description}</div>
+                                  <div className="text-xs text-slate-500 dark:text-slate-400">
+                                    {expense.groupName || 'No group'}{expense.createdBy ? ` • by ${expense.createdBy}` : ''}
+                                  </div>
+                                </div>
+                                <div className="text-right">
+                                  <div className="text-sm font-semibold text-slate-900 dark:text-white">{expense.cost} {expense.currencyCode || ''}</div>
+                                  <div className="text-xs text-slate-500 dark:text-slate-400">{new Date(expense.date).toLocaleDateString()}</div>
+                                </div>
+                              </div>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-500 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-400">
+                            No non-zero recent expenses returned for this account.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </details>
+              ) : null}
+            </CardContent>
+          </Card>
+        </div>
       )}
 
       <Dialog open={confirmDialog.open} onOpenChange={(open) => setConfirmDialog(prev => ({ ...prev, open }))}>

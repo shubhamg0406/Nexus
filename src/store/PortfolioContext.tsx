@@ -27,12 +27,15 @@ import { applyPriceFormula } from '../lib/priceFormula';
 import {
   buildPortfolioName,
   createDefaultPortfolio,
+  derivePortfolioCurrencies,
   getActivePortfolioStorageKey,
   getPersonalPortfolioId,
   isLegacySelfPortfolioCandidate,
   normalizePortfolio,
   removeLegacySelfPortfolioDuplicates,
   shouldHydratePersonalPortfolioFromLegacy,
+  type PortfolioBaseCurrency,
+  type PortfolioCurrency,
   type PortfolioDocument,
   type PortfolioMember,
   type PortfolioSummary,
@@ -49,6 +52,10 @@ import {
   normalizeUserBrokerConnections,
   normalizeUserProviderOverrides,
 } from './userPreferences';
+import { useConnectedAccounts } from './ConnectedAccountsContext';
+import { useSplitwise } from './SplitwiseContext';
+import { mapSplitwiseSummaryToAssets } from './splitwiseAssetMapper';
+import { disconnectSharedIntegration, getSharedIntegrations, refreshSharedIntegration, type SharedIntegrationMember } from '../lib/sharedIntegrationsApi';
 
 export interface ImportProgress {
   visible: boolean;
@@ -65,8 +72,17 @@ interface PortfolioContextType {
   activePortfolioId: string | null;
   setActivePortfolioId: (id: string) => void;
   currentUserRole: PortfolioMember['role'] | null;
-  baseCurrency: 'CAD' | 'INR' | 'USD' | 'ORIGINAL';
-  setBaseCurrency: (currency: 'CAD' | 'INR' | 'USD' | 'ORIGINAL') => Promise<void>;
+  sharedIntegrationMembers: SharedIntegrationMember[];
+  refreshSharedIntegrations: () => Promise<void>;
+  disconnectMemberIntegration: (provider: 'upstox' | 'splitwise', targetUid: string) => Promise<void>;
+  refreshMemberIntegration: (provider: 'upstox' | 'splitwise', targetUid: string) => Promise<void>;
+  baseCurrency: PortfolioBaseCurrency;
+  setBaseCurrency: (currency: PortfolioBaseCurrency) => Promise<void>;
+  primaryCurrency: PortfolioCurrency;
+  secondaryCurrency: PortfolioCurrency;
+  setPrimaryCurrency: (currency: PortfolioCurrency) => Promise<void>;
+  setSecondaryCurrency: (currency: PortfolioCurrency) => Promise<void>;
+  setPortfolioCurrencies: (primary: PortfolioCurrency, secondary: PortfolioCurrency) => Promise<void>;
   rates: Record<string, number> | null;
   sharedPriceProviderSettings: PriceProviderSettings;
   priceProviderSettings: PriceProviderSettings;
@@ -87,7 +103,9 @@ interface PortfolioContextType {
   replaceCloudPortfolio: (data: {
     assets: Asset[];
     assetClasses: AssetClassDef[];
-    baseCurrency?: 'CAD' | 'INR' | 'USD' | 'ORIGINAL';
+    baseCurrency?: PortfolioBaseCurrency;
+    primaryCurrency?: PortfolioCurrency;
+    secondaryCurrency?: PortfolioCurrency;
     priceProviderSettings?: PriceProviderSettings;
   }) => Promise<void>;
   addAssetClass: (cls: Omit<AssetClassDef, 'id'>) => Promise<void>;
@@ -166,7 +184,10 @@ const ALPHAVANTAGE_REFRESH_BATCH_SIZE = 8;
 const EMPTY_PORTFOLIO: PortfolioDocument = {
   assets: [],
   assetClasses: [],
-  baseCurrency: 'ORIGINAL',
+  baseCurrency: 'CAD',
+  primaryCurrency: 'CAD',
+  secondaryCurrency: 'USD',
+  currencySettingsVersion: 1,
   members: [],
   memberEmails: [],
   name: '',
@@ -191,9 +212,26 @@ const EMPTY_BULK_REFRESH_STATE: BulkRefreshRunState = {
   queues: [],
   issues: [],
 };
+const PORTFOLIO_CACHE_VERSION = 1;
+
+interface CachedPortfolioSnapshot {
+  id: string;
+  name: string;
+  ownerEmail: string;
+  isPersonal: boolean;
+  document: PortfolioDocument;
+}
+
+interface PortfolioCachePayload {
+  version: number;
+  activePortfolioId: string | null;
+  portfolios: CachedPortfolioSnapshot[];
+}
 
 export function PortfolioProvider({ children }: { children: React.ReactNode }) {
   const { user } = useAuth();
+  const { upstox, saveUpstoxOverride, refreshUpstox } = useConnectedAccounts();
+  const { status: splitwiseStatus, summary: splitwiseSummary, refresh: refreshSplitwise } = useSplitwise();
   const [portfolio, setPortfolio] = useState<PortfolioDocument>(EMPTY_PORTFOLIO);
   const [portfolios, setPortfolios] = useState<PortfolioSummary[]>([]);
   const [activePortfolioId, setActivePortfolioIdState] = useState<string | null>(null);
@@ -211,9 +249,29 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
   const [hasAccess, setHasAccess] = useState(false);
   const [accessError, setAccessError] = useState<string | null>(null);
   const [importProgress, setImportProgress] = useState<ImportProgress>(EMPTY_PROGRESS);
+  const [sharedIntegrationMembers, setSharedIntegrationMembers] = useState<SharedIntegrationMember[]>([]);
   const effectivePriceProviderSettings = useMemo(
     () => mergePriceProviderSettings(portfolio.priceProviderSettings, userProviderOverrides),
     [portfolio.priceProviderSettings, userProviderOverrides],
+  );
+  const connectedAssets = useMemo(
+    () => sharedIntegrationMembers.flatMap((member) => mapConnectedHoldingsToAssets(member.upstox.holdings, member.member.label)),
+    [sharedIntegrationMembers],
+  );
+  const splitwiseAssets = useMemo(
+    () => sharedIntegrationMembers.flatMap((member) => mapSplitwiseSummaryToAssets(
+      member.splitwise.status.status === 'connected' ? 'connected' : 'disconnected',
+      member.splitwise.summary,
+      member.member.label,
+      portfolio.primaryCurrency || 'CAD',
+      rates,
+      member.member.uid,
+    )),
+    [sharedIntegrationMembers, portfolio.primaryCurrency, rates],
+  );
+  const mergedAssets = useMemo(
+    () => [...portfolio.assets, ...connectedAssets, ...splitwiseAssets],
+    [connectedAssets, portfolio.assets, splitwiseAssets],
   );
   const currentUserRole = useMemo(() => {
     if (!user?.email) return null;
@@ -227,12 +285,24 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
   const portfolioRef = React.useRef(portfolio);
   const ratesRef = React.useRef(rates);
   const settingsRef = React.useRef(DEFAULT_PRICE_PROVIDER_SETTINGS);
+  const activePortfolioIdRef = React.useRef<string | null>(null);
+  const userRef = React.useRef(user);
   const massiveQueueTimeoutRef = React.useRef<number | null>(null);
   const alphaVantageQueueTimeoutRef = React.useRef<number | null>(null);
+  const migrationInFlightRef = React.useRef(new Set<string>());
+  const memberUidBindingRef = React.useRef(new Set<string>());
 
   useEffect(() => {
     portfolioRef.current = portfolio;
   }, [portfolio]);
+
+  useEffect(() => {
+    activePortfolioIdRef.current = activePortfolioId;
+  }, [activePortfolioId]);
+
+  useEffect(() => {
+    userRef.current = user;
+  }, [user]);
 
   useEffect(() => {
     ratesRef.current = rates;
@@ -272,6 +342,8 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
       setPortfolio(EMPTY_PORTFOLIO);
       setPortfolios([]);
       setActivePortfolioIdState(null);
+      activePortfolioIdRef.current = null;
+      setSharedIntegrationMembers([]);
       setUserProviderOverrides(DEFAULT_USER_PROVIDER_OVERRIDES);
       setUserBrokerConnections(DEFAULT_BROKER_CONNECTIONS);
       setBulkRefreshState(EMPTY_BULK_REFRESH_STATE);
@@ -285,6 +357,25 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
     setIsPortfolioLoading(true);
     const personalPortfolioId = getPersonalPortfolioId(user.uid);
     const personalPortfolioRef = doc(db, 'portfolios', personalPortfolioId);
+    const cachedPortfolioState = readPortfolioCache(user.uid);
+    if (cachedPortfolioState && cachedPortfolioState.portfolios.length > 0) {
+      const persistedPortfolioId = window.localStorage.getItem(getActivePortfolioStorageKey(user.uid));
+      const nextActivePortfolioId = selectActivePortfolioId({
+        currentActivePortfolioId: activePortfolioIdRef.current,
+        persistedPortfolioId: persistedPortfolioId || cachedPortfolioState.activePortfolioId,
+        availablePortfolios: cachedPortfolioState.portfolios,
+        personalPortfolioId,
+      });
+      const activeCachedPortfolio = cachedPortfolioState.portfolios.find((candidate) => candidate.id === nextActivePortfolioId)
+        || cachedPortfolioState.portfolios[0];
+      setPortfolios(cachedPortfolioState.portfolios.map(({ document: _document, ...summary }) => summary));
+      setActivePortfolioIdState(activeCachedPortfolio.id);
+      activePortfolioIdRef.current = activeCachedPortfolio.id;
+      setPortfolio(activeCachedPortfolio.document);
+      setHasAccess(true);
+      setAccessError(null);
+      setIsPortfolioLoading(false);
+    }
     void ensurePersonalPortfolio(personalPortfolioRef, user.email, user.uid);
 
     const portfoliosQuery = query(
@@ -336,16 +427,45 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
 
         const persistedPortfolioId = window.localStorage.getItem(getActivePortfolioStorageKey(user.uid));
         const nextActivePortfolioId = selectActivePortfolioId({
-          currentActivePortfolioId: activePortfolioId,
+          currentActivePortfolioId: activePortfolioIdRef.current,
           persistedPortfolioId,
           availablePortfolios: visiblePortfolios,
           personalPortfolioId,
         });
         const activePortfolio = visiblePortfolios.find((candidate) => candidate.id === nextActivePortfolioId) || visiblePortfolios[0];
 
+        const normalizedEmail = user.email.trim().toLowerCase();
+        const matchingMember = activePortfolio.document.members.find(
+          (member) => (member.email || '').trim().toLowerCase() === normalizedEmail,
+        );
+        if (matchingMember && !matchingMember.uid) {
+          const bindingKey = `${activePortfolio.id}:${user.uid}`;
+          if (!memberUidBindingRef.current.has(bindingKey)) {
+            memberUidBindingRef.current.add(bindingKey);
+            void bindMemberUidToPortfolio(activePortfolio.id, user.uid, normalizedEmail)
+              .finally(() => {
+                memberUidBindingRef.current.delete(bindingKey);
+              });
+          }
+        }
+
+        if (activePortfolio.document.currencySettingsVersion !== 1 && !migrationInFlightRef.current.has(activePortfolio.id)) {
+          migrationInFlightRef.current.add(activePortfolio.id);
+          void migratePortfolioCurrencySettings(doc(db, 'portfolios', activePortfolio.id))
+            .finally(() => {
+              migrationInFlightRef.current.delete(activePortfolio.id);
+            });
+        }
+
         setPortfolios(visiblePortfolios.map(({ document: _document, ...summary }) => summary));
         setActivePortfolioIdState(activePortfolio.id);
+        activePortfolioIdRef.current = activePortfolio.id;
         setPortfolio(activePortfolio.document);
+        writePortfolioCache(user.uid, {
+          version: PORTFOLIO_CACHE_VERSION,
+          activePortfolioId: activePortfolio.id,
+          portfolios: visiblePortfolios,
+        });
         setHasAccess(true);
         setAccessError(null);
         setIsPortfolioLoading(false);
@@ -358,7 +478,30 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
     );
 
     return unsubscribe;
-  }, [activePortfolioId, user?.email, user?.uid]);
+  }, [user?.email, user?.uid]);
+
+  const refreshSharedIntegrations = React.useCallback(async () => {
+    if (!user?.uid || !activePortfolioId) {
+      setSharedIntegrationMembers([]);
+      return;
+    }
+
+    try {
+      const payload = await getSharedIntegrations(activePortfolioId);
+      setSharedIntegrationMembers(payload.members || []);
+    } catch {
+      setSharedIntegrationMembers([]);
+    }
+  }, [activePortfolioId, user?.uid]);
+
+  useEffect(() => {
+    void refreshSharedIntegrations();
+  }, [
+    refreshSharedIntegrations,
+    upstox?.lastSyncAt,
+    splitwiseStatus,
+    splitwiseSummary?.lastSyncAt,
+  ]);
 
   useEffect(() => {
     if (!user?.uid || !activePortfolioId) return;
@@ -393,30 +536,37 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
   }, [user?.uid]);
 
   const setActivePortfolioId = (id: string) => {
+    activePortfolioIdRef.current = id;
     setActivePortfolioIdState(id);
   };
 
-  const mutatePortfolio = async (updater: (current: PortfolioDocument) => PortfolioDocument) => {
-    if (!activePortfolioId) {
+  const mutatePortfolio = React.useCallback(async (updater: (current: PortfolioDocument) => PortfolioDocument) => {
+    const portfolioId = activePortfolioIdRef.current;
+    if (!portfolioId) {
       throw new Error('No active portfolio selected.');
     }
 
-    const portfolioRef = doc(db, 'portfolios', activePortfolioId);
-    await runTransaction(db, async (transaction) => {
-      const snapshot = await transaction.get(portfolioRef);
-      const current = snapshot.exists()
-        ? normalizePortfolio(snapshot.data() as Partial<PortfolioDocument>)
-        : createDefaultPortfolio(user?.email, user?.uid, activePortfolioId);
-      const next = updater(current);
-      transaction.set(portfolioRef, {
-        ...stripUndefinedDeep({
-          ...next,
-          memberEmails: next.members.map((member) => member.email.toLowerCase()),
-        }),
-        updatedAt: serverTimestamp(),
-      }, { merge: true });
-    });
-  };
+    const current = portfolioRef.current;
+    const fallback = createDefaultPortfolio(userRef.current?.email || '', userRef.current?.uid || '', portfolioId);
+    const source = current.ownerEmail || current.members.length > 0 ? current : fallback;
+    const nextRaw = updater(source);
+    const nextCurrencies = derivePortfolioCurrencies(nextRaw);
+    const next: PortfolioDocument = {
+      ...nextRaw,
+      primaryCurrency: nextCurrencies.primaryCurrency,
+      secondaryCurrency: nextCurrencies.secondaryCurrency,
+      baseCurrency: nextCurrencies.primaryCurrency,
+    };
+    const portfolioDoc = doc(db, 'portfolios', portfolioId);
+    await setDoc(portfolioDoc, {
+      ...stripUndefinedDeep({
+        ...next,
+        memberEmails: next.members.map((member) => member.email.toLowerCase()),
+        currencySettingsVersion: 1 as const,
+      }),
+      updatedAt: serverTimestamp(),
+    }, { merge: true });
+  }, []);
 
   const loadRates = async () => {
     const fetchedRates = await fetchExchangeRates('USD');
@@ -448,10 +598,94 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
     await saveSetting(getUserBrokerConnectionsKey(user.uid), normalized);
   };
 
-  const setBaseCurrency = async (currency: 'CAD' | 'INR' | 'USD' | 'ORIGINAL') => {
+  const disconnectMemberIntegration = React.useCallback(async (
+    provider: 'upstox' | 'splitwise',
+    targetUid: string,
+  ) => {
+    if (!activePortfolioId) {
+      throw new Error('No active portfolio selected.');
+    }
+    await disconnectSharedIntegration({
+      portfolioId: activePortfolioId,
+      provider,
+      targetUid,
+    });
+    await refreshSharedIntegrations();
+    if (provider === 'upstox' && targetUid === user?.uid) {
+      await refreshUpstox();
+    }
+    if (provider === 'splitwise' && targetUid === user?.uid) {
+      await refreshSplitwise();
+    }
+  }, [activePortfolioId, refreshSharedIntegrations, refreshSplitwise, refreshUpstox, user?.uid]);
+
+  const refreshMemberIntegration = React.useCallback(async (
+    provider: 'upstox' | 'splitwise',
+    targetUid: string,
+  ) => {
+    if (!activePortfolioId) {
+      throw new Error('No active portfolio selected.');
+    }
+    await refreshSharedIntegration({
+      portfolioId: activePortfolioId,
+      provider,
+      targetUid,
+    });
+    await refreshSharedIntegrations();
+    if (provider === 'upstox' && targetUid === user?.uid) {
+      await refreshUpstox();
+    }
+    if (provider === 'splitwise' && targetUid === user?.uid) {
+      await refreshSplitwise();
+    }
+  }, [activePortfolioId, refreshSharedIntegrations, refreshSplitwise, refreshUpstox, user?.uid]);
+
+  const setBaseCurrency = async (currency: PortfolioBaseCurrency) => {
+    if (currency === 'ORIGINAL') return;
     await mutatePortfolio((current) => ({
       ...current,
       baseCurrency: currency,
+      primaryCurrency: currency,
+    }));
+  };
+
+  const setPrimaryCurrency = async (currency: PortfolioCurrency) => {
+    if (currentUserRole !== 'owner') {
+      throw new Error('Only portfolio owners can update currency preferences.');
+    }
+    await mutatePortfolio((current) => ({
+      ...current,
+      primaryCurrency: currency,
+      baseCurrency: currency,
+      secondaryCurrency: current.secondaryCurrency === currency
+        ? (currency === 'USD' ? 'CAD' : 'USD')
+        : current.secondaryCurrency,
+    }));
+  };
+
+  const setSecondaryCurrency = async (currency: PortfolioCurrency) => {
+    if (currentUserRole !== 'owner') {
+      throw new Error('Only portfolio owners can update currency preferences.');
+    }
+    await mutatePortfolio((current) => ({
+      ...current,
+      secondaryCurrency: currency === current.primaryCurrency
+        ? (currency === 'USD' ? 'CAD' : 'USD')
+        : currency,
+    }));
+  };
+
+  const setPortfolioCurrencies = async (primary: PortfolioCurrency, secondary: PortfolioCurrency) => {
+    if (currentUserRole !== 'owner') {
+      throw new Error('Only portfolio owners can update currency preferences.');
+    }
+    await mutatePortfolio((current) => ({
+      ...current,
+      primaryCurrency: primary,
+      baseCurrency: primary,
+      secondaryCurrency: secondary === primary
+        ? (primary === 'USD' ? 'CAD' : 'USD')
+        : secondary,
     }));
   };
 
@@ -468,14 +702,19 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
   };
 
   const duplicateAsset = async (id: string) => {
+    const sourceAsset = mergedAssets.find((asset) => asset.id === id);
+    if (sourceAsset?.sourceManaged) {
+      return;
+    }
+
     await mutatePortfolio((current) => {
-      const sourceAsset = current.assets.find((asset) => asset.id === id);
-      if (!sourceAsset) return current;
+      const sourceManualAsset = current.assets.find((asset) => asset.id === id);
+      if (!sourceManualAsset) return current;
 
       const duplicatedAsset: Asset = {
-        ...sourceAsset,
+        ...sourceManualAsset,
         id: crypto.randomUUID(),
-        name: `${sourceAsset.name} Copy`,
+        name: `${sourceManualAsset.name} Copy`,
         lastUpdated: Date.now(),
       };
 
@@ -487,6 +726,17 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
   };
 
   const updateAsset = async (asset: Asset) => {
+    if (asset.sourceManaged && asset.connectedProvider === 'upstox' && asset.connectedHoldingId) {
+      await saveUpstoxOverride(asset.connectedHoldingId, {
+        customLabel: asset.name?.trim() || undefined,
+        ownerOverride: asset.owner?.trim() || undefined,
+        assetClassOverride: asset.assetClass?.trim() || undefined,
+        hidden: asset.hiddenFromDashboard,
+        notes: asset.comments?.trim() || undefined,
+      });
+      return;
+    }
+
     await mutatePortfolio((current) => ({
       ...current,
       assets: current.assets.map((existing) => existing.id === asset.id ? { ...asset, lastUpdated: Date.now() } : existing),
@@ -494,6 +744,12 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
   };
 
   const removeAsset = async (id: string) => {
+    const sourceAsset = mergedAssets.find((asset) => asset.id === id);
+    if (sourceAsset?.sourceManaged && sourceAsset.connectedProvider === 'upstox' && sourceAsset.connectedHoldingId) {
+      await saveUpstoxOverride(sourceAsset.connectedHoldingId, { hidden: true });
+      return;
+    }
+
     await mutatePortfolio((current) => ({
       ...current,
       assets: current.assets.filter((asset) => asset.id !== id),
@@ -501,6 +757,16 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
   };
 
   const refreshAsset = async (id: string) => {
+    const sourceAsset = mergedAssets.find((asset) => asset.id === id);
+    if (sourceAsset?.sourceManaged && sourceAsset.connectedProvider === 'upstox') {
+      await refreshUpstox();
+      return;
+    }
+    if (sourceAsset?.sourceManaged && sourceAsset.connectedProvider === 'splitwise') {
+      await refreshSplitwise();
+      return;
+    }
+
     setIsRefreshing(true);
     try {
       const currentRates = await loadRates() || rates;
@@ -581,14 +847,18 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
   const replaceCloudPortfolio = async (data: {
     assets: Asset[];
     assetClasses: AssetClassDef[];
-    baseCurrency?: 'CAD' | 'INR' | 'USD' | 'ORIGINAL';
+    baseCurrency?: PortfolioBaseCurrency;
+    primaryCurrency?: PortfolioCurrency;
+    secondaryCurrency?: PortfolioCurrency;
     priceProviderSettings?: PriceProviderSettings;
   }) => {
     await mutatePortfolio((current) => ({
       ...current,
       assets: data.assets,
       assetClasses: data.assetClasses,
-      baseCurrency: data.baseCurrency ?? current.baseCurrency,
+      baseCurrency: data.primaryCurrency ?? (data.baseCurrency !== 'ORIGINAL' ? data.baseCurrency : undefined) ?? current.primaryCurrency,
+      primaryCurrency: data.primaryCurrency ?? (data.baseCurrency !== 'ORIGINAL' ? data.baseCurrency : undefined) ?? current.primaryCurrency,
+      secondaryCurrency: data.secondaryCurrency ?? current.secondaryCurrency,
       priceProviderSettings: data.priceProviderSettings ?? current.priceProviderSettings,
     }));
   };
@@ -819,15 +1089,24 @@ export function PortfolioProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <PortfolioContext.Provider value={{
-      assets: portfolio.assets,
+      assets: mergedAssets,
       assetClasses: portfolio.assetClasses,
       members: portfolio.members,
       portfolios,
       activePortfolioId,
       setActivePortfolioId,
       currentUserRole,
-      baseCurrency: portfolio.baseCurrency,
+      sharedIntegrationMembers,
+      refreshSharedIntegrations,
+      disconnectMemberIntegration,
+      refreshMemberIntegration,
+      baseCurrency: portfolio.primaryCurrency || 'CAD',
       setBaseCurrency,
+      primaryCurrency: portfolio.primaryCurrency || 'CAD',
+      secondaryCurrency: portfolio.secondaryCurrency || 'USD',
+      setPrimaryCurrency,
+      setSecondaryCurrency,
+      setPortfolioCurrencies,
       rates,
       sharedPriceProviderSettings: portfolio.priceProviderSettings,
       priceProviderSettings: effectivePriceProviderSettings,
@@ -873,6 +1152,133 @@ export function usePortfolio() {
     throw new Error('usePortfolio must be used within a PortfolioProvider');
   }
   return context;
+}
+
+async function bindMemberUidToPortfolio(portfolioId: string, uid: string, email: string) {
+  const portfolioRef = doc(db, 'portfolios', portfolioId);
+  await runTransaction(db, async (transaction) => {
+    const snapshot = await transaction.get(portfolioRef);
+    if (!snapshot.exists()) return;
+    const current = normalizePortfolio(snapshot.data() as Partial<PortfolioDocument>);
+    const normalizedEmail = email.trim().toLowerCase();
+    const members = Array.isArray(current.members) ? current.members : [];
+    const hasPendingBinding = members.some((member) => (member.email || '').trim().toLowerCase() === normalizedEmail && !member.uid);
+    if (!hasPendingBinding) return;
+
+    const nextMembers = members.map((member) => {
+      if ((member.email || '').trim().toLowerCase() !== normalizedEmail) return member;
+      if (member.uid) return member;
+      return { ...member, uid };
+    });
+
+    transaction.set(portfolioRef, {
+      members: nextMembers,
+      memberEmails: nextMembers.map((member) => member.email.toLowerCase()),
+      updatedAt: serverTimestamp(),
+    }, { merge: true });
+  });
+}
+
+function mapConnectedHoldingsToAssets(
+  holdings: Array<{
+    id: string;
+    provider: 'upstox';
+    isin?: string;
+    ticker?: string;
+    securityName: string;
+    assetType: 'stock' | 'etf' | 'fund' | 'cash' | 'derivative' | 'other';
+    quantity: number;
+    averageCost?: number;
+    investedValue?: number;
+    price?: number;
+    marketValue?: number;
+    unrealizedPnl?: number;
+    accountCurrency: string;
+    holdingKind?: 'holding' | 'position';
+    positionSide?: 'long' | 'short' | 'unknown';
+    possibleDuplicateOf?: string;
+    override?: {
+      customLabel?: string;
+      ownerOverride?: string;
+      assetClassOverride?: string;
+      hidden?: boolean;
+      notes?: string;
+    } | null;
+  }>,
+  ownerLabel: string,
+): Asset[] {
+  return holdings.map((holding) => {
+    const quantity = Number.isFinite(holding.quantity) ? holding.quantity : 0;
+    const reportedAverageCost = Number.isFinite(holding.averageCost) ? Number(holding.averageCost) : 0;
+    const marketValue = Number.isFinite(holding.marketValue) ? Number(holding.marketValue) : quantity * (holding.price || 0);
+    const investedValue = Number.isFinite(holding.investedValue)
+      ? Number(holding.investedValue)
+      : Number.isFinite(holding.unrealizedPnl)
+        ? marketValue - Number(holding.unrealizedPnl)
+        : 0;
+    const averageCost = reportedAverageCost > 0
+      ? reportedAverageCost
+      : quantity !== 0 && investedValue > 0
+        ? investedValue / quantity
+        : 0;
+    const currentPrice = Number.isFinite(holding.price)
+      ? Number(holding.price)
+      : quantity > 0
+        ? marketValue / quantity
+        : 0;
+
+    const assetClass = 'Upstox Cloud';
+    const currency = normalizeAssetCurrency(holding.accountCurrency);
+    const hidden = Boolean(holding.override?.hidden);
+
+    return {
+      id: `connected:${holding.id}`,
+      name: holding.override?.customLabel || holding.securityName || holding.ticker || holding.isin || 'Connected holding',
+      ticker: holding.ticker || holding.isin,
+      quantity,
+      costBasis: quantity !== 0 && averageCost > 0 ? quantity * averageCost : investedValue,
+      currency,
+      owner: ownerLabel,
+      country: 'India',
+      assetClass,
+      autoUpdate: false,
+      currentPrice: Number.isFinite(currentPrice) ? currentPrice : 0,
+      priceFetchStatus: 'success',
+      priceFetchMessage: holding.holdingKind === 'position'
+        ? 'Synced from Upstox short-term positions (read-only).'
+        : 'Synced from Upstox holdings (read-only).',
+      priceProvider: 'upstox',
+      holdingPlatform: 'Upstox Cloud',
+      comments: holding.override?.notes || undefined,
+      sourceType: 'connected',
+      sourceManaged: true,
+      connectedProvider: 'upstox',
+      connectedHoldingId: holding.id,
+      holdingKind: holding.holdingKind || 'holding',
+      positionSide: holding.positionSide,
+      hiddenFromDashboard: hidden,
+      possibleDuplicateOf: holding.possibleDuplicateOf,
+    } satisfies Asset;
+  });
+}
+
+function normalizeAssetCurrency(value?: string): 'CAD' | 'INR' | 'USD' {
+  const upper = (value || '').trim().toUpperCase();
+  if (upper === 'CAD') return 'CAD';
+  if (upper === 'USD') return 'USD';
+  return 'INR';
+}
+
+function isTemporaryPriceProviderIssue(message: string) {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes('temporarily') ||
+    normalized.includes('rate-limit') ||
+    normalized.includes('rate limit') ||
+    normalized.includes('cooldown') ||
+    normalized.includes('try again') ||
+    normalized.includes('unavailable')
+  );
 }
 
 async function refreshAssetPrices(
@@ -1499,6 +1905,74 @@ function stripUndefinedDeep<T>(value: T): T {
   return value;
 }
 
+function getPortfolioCacheKey(uid: string) {
+  return `nexus_assets_cache_${uid}`;
+}
+
+function readPortfolioCache(uid: string): PortfolioCachePayload | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(getPortfolioCacheKey(uid));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<PortfolioCachePayload>;
+    if (parsed.version !== PORTFOLIO_CACHE_VERSION) return null;
+    if (!Array.isArray(parsed.portfolios)) return null;
+
+    const portfolios = parsed.portfolios
+      .map((entry) => {
+        if (!entry || typeof entry !== 'object') return null;
+        const id = typeof entry.id === 'string' ? entry.id : '';
+        if (!id) return null;
+        const normalized = normalizePortfolio((entry as { document?: Partial<PortfolioDocument> }).document || {});
+        return {
+          id,
+          name: typeof entry.name === 'string' ? entry.name : '',
+          ownerEmail: typeof entry.ownerEmail === 'string' ? entry.ownerEmail : '',
+          isPersonal: Boolean(entry.isPersonal),
+          document: normalized,
+        } satisfies CachedPortfolioSnapshot;
+      })
+      .filter(Boolean) as CachedPortfolioSnapshot[];
+
+    return {
+      version: PORTFOLIO_CACHE_VERSION,
+      activePortfolioId: typeof parsed.activePortfolioId === 'string' ? parsed.activePortfolioId : null,
+      portfolios,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writePortfolioCache(uid: string, payload: PortfolioCachePayload) {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(getPortfolioCacheKey(uid), JSON.stringify(payload));
+  } catch {
+    // Best-effort cache write.
+  }
+}
+
+async function migratePortfolioCurrencySettings(portfolioRef: ReturnType<typeof doc>) {
+  await runTransaction(db, async (transaction) => {
+    const snapshot = await transaction.get(portfolioRef);
+    if (!snapshot.exists()) return;
+    const current = normalizePortfolio(snapshot.data() as Partial<PortfolioDocument>);
+    if (current.currencySettingsVersion === 1) return;
+
+    const derived = derivePortfolioCurrencies(current);
+    transaction.set(portfolioRef, {
+      ...stripUndefinedDeep({
+        primaryCurrency: derived.primaryCurrency,
+        secondaryCurrency: derived.secondaryCurrency,
+        baseCurrency: derived.primaryCurrency,
+        currencySettingsVersion: 1 as const,
+      }),
+      updatedAt: serverTimestamp(),
+    }, { merge: true });
+  });
+}
+
 async function ensurePersonalPortfolio(portfolioRef: ReturnType<typeof doc>, email: string, uid: string) {
   await runTransaction(db, async (transaction) => {
     const snapshot = await transaction.get(portfolioRef);
@@ -1529,7 +2003,14 @@ async function hydratePersonalPortfolioFromLegacy(
         ...currentPersonal,
         assets: legacyPortfolio.assets,
         assetClasses: legacyPortfolio.assetClasses,
-        baseCurrency: legacyPortfolio.baseCurrency ?? currentPersonal.baseCurrency,
+        baseCurrency: legacyPortfolio.primaryCurrency
+          || (legacyPortfolio.baseCurrency !== 'ORIGINAL' ? legacyPortfolio.baseCurrency : undefined)
+          || currentPersonal.primaryCurrency,
+        primaryCurrency: legacyPortfolio.primaryCurrency
+          || (legacyPortfolio.baseCurrency !== 'ORIGINAL' ? legacyPortfolio.baseCurrency : undefined)
+          || currentPersonal.primaryCurrency,
+        secondaryCurrency: legacyPortfolio.secondaryCurrency || currentPersonal.secondaryCurrency,
+        currencySettingsVersion: 1 as const,
         priceProviderSettings: legacyPortfolio.priceProviderSettings ?? currentPersonal.priceProviderSettings,
       }),
       updatedAt: serverTimestamp(),

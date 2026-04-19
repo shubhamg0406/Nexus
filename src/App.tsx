@@ -5,18 +5,23 @@ import { Asset } from './store/db';
 import { Dashboard } from './components/Dashboard';
 import { Ledger } from './components/Ledger';
 import { AddAssetModal } from './components/AddAssetModal';
-import { Settings } from './components/Settings';
+import { Settings, type SettingsSection } from './components/Settings';
 import { ImportProgressOverlay } from './components/ImportProgressOverlay';
 import { Button } from './components/ui/button';
 import { Select } from './components/ui/select';
 import { RefreshCw, Moon, Sun, Settings as SettingsIcon, LayoutDashboard, Wallet, FileText, LogOut, ArrowRight, CheckCircle2, Globe2, Shield, Sparkles } from 'lucide-react';
+import { SplitwiseProvider } from './store/SplitwiseContext';
+import { ConnectedAccountsProvider } from './store/ConnectedAccountsContext';
+import { parseInitialViewFromQuery } from './lib/appNavigation';
 
 function MainApp() {
   const { user, logout } = useAuth();
   const { refreshPrices, isRefreshing, portfolios, activePortfolioId, setActivePortfolioId } = usePortfolio();
+  const initialView = parseInitialViewFromQuery();
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [editingAsset, setEditingAsset] = useState<Asset | undefined>(undefined);
-  const [currentView, setCurrentView] = useState<'dashboard' | 'assets' | 'settings'>('dashboard');
+  const [currentView, setCurrentView] = useState<'dashboard' | 'assets' | 'settings'>(initialView.view);
+  const [settingsSection] = useState<SettingsSection | undefined>(initialView.settingsSection);
   const [isDarkMode, setIsDarkMode] = useState(false);
 
   useEffect(() => {
@@ -128,7 +133,7 @@ function MainApp() {
       <main className="container mx-auto px-4 py-8">
         {currentView === 'dashboard' && <Dashboard />}
         {currentView === 'assets' && <Ledger onEditAsset={handleEditAsset} onAddAsset={() => setIsAddModalOpen(true)} />}
-        {currentView === 'settings' && <Settings />}
+        {currentView === 'settings' && <Settings initialSection={settingsSection} />}
       </main>
 
       <AddAssetModal 
@@ -303,9 +308,13 @@ function CenteredState({ title, description, action }: { title: string; descript
 export default function App() {
   return (
     <AuthProvider>
-      <PortfolioProvider>
-        <AuthenticatedApp />
-      </PortfolioProvider>
+      <ConnectedAccountsProvider>
+        <SplitwiseProvider>
+          <PortfolioProvider>
+            <AuthenticatedApp />
+          </PortfolioProvider>
+        </SplitwiseProvider>
+      </ConnectedAccountsProvider>
     </AuthProvider>
   );
 }

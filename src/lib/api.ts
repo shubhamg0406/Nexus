@@ -48,12 +48,29 @@ export async function fetchExchangeRates(base: string = 'USD') {
 }
 
 export async function fetchHistoricalExchangeRate(date: string, from: string, to: string) {
+  const normalizedFrom = from.trim().toUpperCase();
+  const normalizedTo = to.trim().toUpperCase();
+  const normalizedDate = date.trim();
+  const endpoints = [
+    `https://api.frankfurter.dev/v2/rate/${encodeURIComponent(normalizedFrom)}/${encodeURIComponent(normalizedTo)}?date=${encodeURIComponent(normalizedDate)}`,
+    `https://api.frankfurter.app/${encodeURIComponent(normalizedDate)}?from=${encodeURIComponent(normalizedFrom)}&to=${encodeURIComponent(normalizedTo)}`,
+  ];
+
   try {
-    const response = await fetch(`https://api.frankfurter.app/${date}?from=${from}&to=${to}`);
-    const data = await response.json();
-    if (data && data.rates && data.rates[to]) {
-      return data.rates[to];
+    for (const endpoint of endpoints) {
+      const response = await fetch(endpoint);
+      if (!response.ok) continue;
+      const data = await response.json();
+      const v2Rate = data?.rate;
+      if (typeof v2Rate === 'number' && Number.isFinite(v2Rate)) {
+        return v2Rate;
+      }
+      const legacyRate = data?.rates?.[normalizedTo];
+      if (typeof legacyRate === 'number' && Number.isFinite(legacyRate)) {
+        return legacyRate;
+      }
     }
+
     return null;
   } catch (error) {
     console.error('Failed to fetch historical exchange rate:', error);

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildPortfolioName,
   createDefaultPortfolio,
+  derivePortfolioCurrencies,
   getActivePortfolioStorageKey,
   getPersonalPortfolioId,
   isLegacySelfPortfolioCandidate,
@@ -20,6 +21,9 @@ describe('portfolioHelpers', () => {
     expect(portfolio.ownerEmail).toBe('shubhamg266@gmail.com');
     expect(portfolio.ownerUid).toBe(uid);
     expect(portfolio.isPersonal).toBe(true);
+    expect(portfolio.primaryCurrency).toBe('CAD');
+    expect(portfolio.secondaryCurrency).toBe('USD');
+    expect(portfolio.currencySettingsVersion).toBe(1);
     expect(portfolio.members).toEqual([{ email: 'shubhamg266@gmail.com', role: 'owner' }]);
     expect(portfolio.memberEmails).toEqual(['shubhamg266@gmail.com']);
   });
@@ -39,6 +43,8 @@ describe('portfolioHelpers', () => {
     });
 
     expect(normalized.baseCurrency).toBe('ORIGINAL');
+    expect(normalized.primaryCurrency).toBe('CAD');
+    expect(normalized.secondaryCurrency).toBe('USD');
     expect(normalized.memberEmails).toEqual(['Partner@Example.com']);
     expect(normalized.name).toBe('');
     expect(normalized.ownerEmail).toBe('');
@@ -199,5 +205,40 @@ describe('portfolioHelpers', () => {
         assetClasses: [],
       },
     )).toBe(false);
+  });
+
+  it('uses base currency as primary during derivation when available', () => {
+    expect(derivePortfolioCurrencies({
+      baseCurrency: 'INR',
+      assets: [],
+    })).toEqual({
+      primaryCurrency: 'INR',
+      secondaryCurrency: 'USD',
+    });
+  });
+
+  it('infers dominant asset currency when legacy base currency is original', () => {
+    expect(derivePortfolioCurrencies({
+      baseCurrency: 'ORIGINAL',
+      assets: [
+        { currency: 'USD', costBasis: 100 } as never,
+        { currency: 'CAD', costBasis: 1000 } as never,
+      ],
+    })).toEqual({
+      primaryCurrency: 'CAD',
+      secondaryCurrency: 'USD',
+    });
+  });
+
+  it('preserves explicit primary/secondary currencies', () => {
+    expect(derivePortfolioCurrencies({
+      baseCurrency: 'ORIGINAL',
+      primaryCurrency: 'USD',
+      secondaryCurrency: 'CAD',
+      assets: [{ currency: 'INR', costBasis: 9999 } as never],
+    })).toEqual({
+      primaryCurrency: 'USD',
+      secondaryCurrency: 'CAD',
+    });
   });
 });

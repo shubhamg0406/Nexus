@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_PRICE_PROVIDER_SETTINGS,
   fetchAutoMatchedPriceForAsset,
+  fetchHistoricalExchangeRate,
   fetchPriceWithProviderOrder,
   fetchStockPrice,
   getGoldPrice,
@@ -300,5 +301,41 @@ describe('api pricing helpers', () => {
     expect(String(fetchMock.mock.calls[0]?.[0])).toContain('/api/finance');
     expect(result.provider).toBe('upstox');
     expect(result.price).toBe(2450.1);
+  });
+
+  it('fetches historical fx from Frankfurter v2 rate endpoint first', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ rate: 83.12 }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await fetchHistoricalExchangeRate('2026-04-11', 'usd', 'inr');
+
+    expect(result).toBe(83.12);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain('api.frankfurter.dev/v2/rate/USD/INR?date=2026-04-11');
+  });
+
+  it('falls back to legacy Frankfurter response shape when v2 is unavailable', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        json: async () => ({}),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          rates: {
+            INR: 83.45,
+          },
+        }),
+      });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await fetchHistoricalExchangeRate('2026-04-11', 'USD', 'INR');
+
+    expect(result).toBe(83.45);
+    expect(String(fetchMock.mock.calls[1]?.[0])).toContain('api.frankfurter.app/2026-04-11?from=USD&to=INR');
   });
 });

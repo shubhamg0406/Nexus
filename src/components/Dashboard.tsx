@@ -85,6 +85,7 @@ type ChartAnalytics = {
 
 export function Dashboard() {
   const { assets, rates, refreshPrices, isRefreshing, refreshQueue } = usePortfolio();
+  const visibleAssets = useMemo(() => assets.filter((asset) => !asset.hiddenFromDashboard), [assets]);
   const [scope, setScope] = useState<DashboardScope>('ALL');
   const [memberFilter, setMemberFilter] = useState('ALL');
   const [currencySelection, setCurrencySelection] = useState<CurrencySelection>('ORIGINAL');
@@ -94,10 +95,10 @@ export function Dashboard() {
   const [growthWindowMonths, setGrowthWindowMonths] = useState(6);
 
   const scopeAssets = useMemo(() => {
-    if (scope === 'INDIA') return assets.filter((asset) => asset.country === 'India');
-    if (scope === 'CANADA') return assets.filter((asset) => asset.country === 'Canada');
-    return assets;
-  }, [assets, scope]);
+    if (scope === 'INDIA') return visibleAssets.filter((asset) => asset.country === 'India');
+    if (scope === 'CANADA') return visibleAssets.filter((asset) => asset.country === 'Canada');
+    return visibleAssets;
+  }, [scope, visibleAssets]);
 
   const members = useMemo(
     () => Array.from(new Set(assets.map((asset) => asset.owner).filter(Boolean))).map(String).sort(),
@@ -124,6 +125,14 @@ export function Dashboard() {
   const filteredAssets = useMemo(
     () => (memberFilter === 'ALL' ? scopeAssets : scopeAssets.filter((asset) => asset.owner === memberFilter)),
     [memberFilter, scopeAssets],
+  );
+  const chartEligibleAssets = useMemo(
+    () =>
+      filteredAssets.filter((asset) => {
+        if (asset.holdingKind !== 'position') return true;
+        return !asset.assetClass.toLowerCase().includes('derivative');
+      }),
+    [filteredAssets],
   );
 
   const summaryCurrencies: DisplayCurrency[] = useMemo(() => {
@@ -290,8 +299,8 @@ export function Dashboard() {
       chartCurrencies.map((currency) => {
         const selectedAssets =
           currencySelection === 'ORIGINAL'
-            ? filteredAssets.filter((asset) => getOriginalDisplayCurrency(asset) === currency)
-            : filteredAssets;
+            ? chartEligibleAssets.filter((asset) => getOriginalDisplayCurrency(asset) === currency)
+            : chartEligibleAssets;
 
         const countryData = Object.entries(
           selectedAssets.reduce((acc, asset) => {
@@ -413,7 +422,7 @@ export function Dashboard() {
         ] as const;
       }),
     ) as Record<DisplayCurrency, ChartAnalytics>;
-  }, [chartCurrencies, currencySelection, filteredAssets, getConvertedValue, growthWindowMonths, rates]);
+  }, [chartCurrencies, chartEligibleAssets, currencySelection, getConvertedValue, growthWindowMonths, rates]);
 
   const scopeCopy = {
     ALL: 'All filters apply first, then dashboard totals and charts are shown in the selected currency logic.',

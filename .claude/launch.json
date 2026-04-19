@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "nexus-portfolio",
+      "runtimeExecutable": "/usr/local/Cellar/node/25.8.2/bin/node",
+      "runtimeArgs": ["node_modules/.bin/tsx", "server.ts"],
+      "port": 3000
+    }
+  ]
+}

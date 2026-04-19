@@ -29,6 +29,7 @@ type FilterColumnId = 'name' | 'assetClass' | 'position' | 'currentPrice' | 'mar
 type FilterState = Record<FilterColumnId, { selected: string[]; search: string; min: string; max: string }>;
 type LedgerSortMode = 'default' | 'name' | 'assetClass' | 'position' | 'currentPrice' | 'marketValue' | 'performance';
 type SubtotalCurrency = 'CAD' | 'INR' | 'USD';
+type AssetClassFilterOption = { label: string; value: string };
 type LedgerDisplayGroup = {
   assetClass: string;
   rows: Row<Asset>[];
@@ -63,6 +64,14 @@ const EMPTY_FILTER_STATE: FilterState = {
   notes: { selected: [], search: '', min: '', max: '' },
 };
 
+function getAssetCountryForFilter(asset: Asset): 'Canada' | 'India' {
+  return asset.country === 'India' ? 'India' : 'Canada';
+}
+
+function buildAssetClassFilterValue(country: 'Canada' | 'India', assetClass: string): string {
+  return `${country}::${assetClass}`;
+}
+
 export function Ledger({ onEditAsset, onAddAsset }: { onEditAsset?: (asset: Asset) => void; onAddAsset?: () => void }) {
   const { user } = useAuth();
   const { assets, assetClasses, baseCurrency, rates, priceProviderSettings, removeAsset, duplicateAsset, refreshAsset, refreshPrices, refreshFailedPrices, isRefreshing, refreshQueue, bulkRefreshState } = usePortfolio();
@@ -96,26 +105,29 @@ export function Ledger({ onEditAsset, onAddAsset }: { onEditAsset?: (asset: Asse
     [assets],
   );
   const assetClassOptions = useMemo(
-    () => Array.from(new Set(assets.map((asset) => getCanonicalAssetClass(asset.assetClass)).filter(Boolean))).map(String).sort(),
+    () => Array.from(new Set(assets.map((asset) => buildAssetClassFilterValue(getAssetCountryForFilter(asset), getCanonicalAssetClass(asset.assetClass))).filter(Boolean))).map(String).sort(),
     [assets],
   );
   const assetClassOptionsByCountry = useMemo(() => {
-    const groups: Record<'Canada' | 'India', string[]> = { Canada: [], India: [] };
+    const groups: Record<'Canada' | 'India', AssetClassFilterOption[]> = { Canada: [], India: [] };
     const seen = {
       Canada: new Set<string>(),
       India: new Set<string>(),
     };
 
     for (const asset of assets) {
-      const country = asset.country === 'India' ? 'India' : 'Canada';
+      const country = getAssetCountryForFilter(asset);
       const canonical = getCanonicalAssetClass(asset.assetClass);
       if (!canonical || seen[country].has(canonical)) continue;
       seen[country].add(canonical);
-      groups[country].push(canonical);
+      groups[country].push({
+        label: canonical,
+        value: buildAssetClassFilterValue(country, canonical),
+      });
     }
 
-    groups.Canada.sort();
-    groups.India.sort();
+    groups.Canada.sort((left, right) => left.label.localeCompare(right.label));
+    groups.India.sort((left, right) => left.label.localeCompare(right.label));
     return groups;
   }, [assets]);
   const getConvertedValue = React.useCallback(
@@ -134,11 +146,11 @@ export function Ledger({ onEditAsset, onAddAsset }: { onEditAsset?: (asset: Asse
   const baseFilteredAssets = useMemo(
     () => assets.filter((asset) => {
       const matchesMember = memberFilter === 'ALL' || asset.owner === memberFilter;
-      const matchesClass = assetClassFilter === 'ALL' || getCanonicalAssetClass(asset.assetClass) === assetClassFilter;
+      const matchesClass = assetClassFilter === 'ALL' || buildAssetClassFilterValue(getAssetCountryForFilter(asset), getCanonicalAssetClass(asset.assetClass)) === assetClassFilter;
       const matchesPricing =
         pricingFilter === 'ALL' ||
-        (pricingFilter === 'AUTO' && asset.autoUpdate && !hasActionablePriceFailure(asset)) ||
-        (pricingFilter === 'MANUAL' && !asset.autoUpdate) ||
+        (pricingFilter === 'AUTO' && isLivePricingAsset(asset) && !hasActionablePriceFailure(asset)) ||
+        (pricingFilter === 'MANUAL' && !isLivePricingAsset(asset)) ||
         (pricingFilter === 'FAILED' && hasActionablePriceFailure(asset));
       const normalizedSearch = searchQuery.trim().toLowerCase();
       const matchesSearch =
@@ -204,7 +216,7 @@ export function Ledger({ onEditAsset, onAddAsset }: { onEditAsset?: (asset: Asse
     if (columnId === 'assetClass') return [getCanonicalAssetClass(asset.assetClass)];
     if (columnId === 'notes') {
       const rowStatus = getBulkRefreshRowStatus(asset);
-      const tags = [asset.autoUpdate ? (rowStatus === 'failed_actionable' ? 'Needs Attention' : rowStatus === 'queued_next_window' ? 'Queued Refresh' : rowStatus === 'using_cached_close_today' ? 'Cached Close' : rowStatus === 'using_last_saved_price' ? 'Using Last Saved Price' : 'Live Price') : 'Manual Pricing'];
+      const tags = [isLivePricingAsset(asset) ? (rowStatus === 'failed_actionable' ? 'Needs Attention' : rowStatus === 'queued_next_window' ? 'Queued Refresh' : rowStatus === 'using_cached_close_today' ? 'Cached Close' : rowStatus === 'using_last_saved_price' ? 'Using Last Saved Price' : 'Live Price') : 'Manual Pricing'];
       tags.push(asset.comments ? 'Has Comments' : 'No Comments');
       if (asset.holdingPlatform) tags.push(asset.holdingPlatform);
       return tags;
@@ -324,6 +336,11 @@ export function Ledger({ onEditAsset, onAddAsset }: { onEditAsset?: (asset: Asse
                 <span className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${toneClasses.chip}`}>
                   {asset.holdingPlatform || getCanonicalAssetClass(asset.assetClass)}
                 </span>
+                {asset.sourceManaged ? (
+                  <span className="rounded-full bg-amber-100 px-2.5 py-1 text-[11px] font-medium text-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+                    {asset.connectedProvider === 'splitwise' ? 'Via Splitwise' : 'Source-managed'}
+                  </span>
+                ) : null}
               </div>
               {supportsTickerPricing ? (
                 <div className="space-y-1">
@@ -337,7 +354,7 @@ export function Ledger({ onEditAsset, onAddAsset }: { onEditAsset?: (asset: Asse
                       {hasFailedPrice ? <AlertTriangle className="h-3.5 w-3.5" /> : null}
                       {getPricingActionLabel(asset)}
                     </button>
-                    {!isGoldAsset(asset) && asset.ticker ? (
+                    {((!isGoldAsset(asset) && asset.ticker) || asset.connectedProvider === 'splitwise') ? (
                       <button
                         type="button"
                         onClick={() => void handleRefreshRow(asset.id)}
@@ -521,7 +538,7 @@ export function Ledger({ onEditAsset, onAddAsset }: { onEditAsset?: (asset: Asse
           return (
             <div className="space-y-1">
               <div className="text-sm text-slate-700 dark:text-slate-200">{asset.comments || 'No comments added'}</div>
-              <div className="text-xs text-slate-500 dark:text-slate-400">{asset.autoUpdate ? 'Live price enabled' : 'Manual pricing'}</div>
+              <div className="text-xs text-slate-500 dark:text-slate-400">{getPricingModeLabel(asset)}</div>
             </div>
           );
         },
@@ -546,39 +563,45 @@ export function Ledger({ onEditAsset, onAddAsset }: { onEditAsset?: (asset: Asse
               </Button>
               {menuOpen ? (
                 <div className="absolute right-0 top-10 z-30 min-w-[180px] rounded-xl border border-slate-200 bg-white p-1.5 shadow-xl dark:border-slate-800 dark:bg-slate-950">
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      setOpenRowMenuId(null);
-                      await duplicateAsset(asset.id);
-                    }}
-                    className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-900"
-                  >
-                    <WalletCards className="h-4 w-4" />
-                    Duplicate Asset
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setOpenRowMenuId(null);
-                      onEditAsset?.(asset);
-                    }}
-                    className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-900"
-                  >
-                    <Edit className="h-4 w-4" />
-                    Edit
-                  </button>
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      setOpenRowMenuId(null);
-                      await removeAsset(asset.id);
-                    }}
-                    className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30"
-                  >
-                    <Trash2 className="h-4 w-4" />
-                    Delete
-                  </button>
+                  {!asset.sourceManaged ? (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        setOpenRowMenuId(null);
+                        await duplicateAsset(asset.id);
+                      }}
+                      className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-900"
+                    >
+                      <WalletCards className="h-4 w-4" />
+                      Duplicate Asset
+                    </button>
+                  ) : null}
+                  {!asset.sourceManaged ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setOpenRowMenuId(null);
+                        onEditAsset?.(asset);
+                      }}
+                      className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-900"
+                    >
+                      <Edit className="h-4 w-4" />
+                      Edit
+                    </button>
+                  ) : null}
+                  {!asset.sourceManaged ? (
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        setOpenRowMenuId(null);
+                        await removeAsset(asset.id);
+                      }}
+                      className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                      Delete
+                    </button>
+                  ) : null}
                 </div>
               ) : null}
             </div>
@@ -605,7 +628,7 @@ export function Ledger({ onEditAsset, onAddAsset }: { onEditAsset?: (asset: Asse
     [filteredAssets],
   );
   const manualAssets = useMemo(
-    () => filteredAssets.filter((asset) => !asset.autoUpdate),
+    () => filteredAssets.filter((asset) => !isLivePricingAsset(asset)),
     [filteredAssets],
   );
   const globalFailedAssets = useMemo(
@@ -613,11 +636,11 @@ export function Ledger({ onEditAsset, onAddAsset }: { onEditAsset?: (asset: Asse
     [assets],
   );
   const globalManualAssets = useMemo(
-    () => assets.filter((asset) => !asset.autoUpdate),
+    () => assets.filter((asset) => !isLivePricingAsset(asset)),
     [assets],
   );
   const globalMarketLinkedAssets = useMemo(
-    () => assets.filter((asset) => asset.autoUpdate),
+    () => assets.filter((asset) => isLivePricingAsset(asset)),
     [assets],
   );
   const statsModalAssets = statsModal.type === 'failed'
@@ -888,12 +911,16 @@ export function Ledger({ onEditAsset, onAddAsset }: { onEditAsset?: (asset: Asse
                       </div>
                     </div>
                     <div className="flex items-center gap-1">
-                      <Button variant="ghost" size="icon" onClick={() => onEditAsset?.(asset)}>
-                        <Edit className="h-4 w-4 text-slate-500" />
-                      </Button>
-                      <Button variant="ghost" size="icon" onClick={() => removeAsset(asset.id)}>
-                        <Trash2 className="h-4 w-4 text-red-500" />
-                      </Button>
+                      {!asset.sourceManaged ? (
+                        <Button variant="ghost" size="icon" onClick={() => onEditAsset?.(asset)}>
+                          <Edit className="h-4 w-4 text-slate-500" />
+                        </Button>
+                      ) : null}
+                      {!asset.sourceManaged ? (
+                        <Button variant="ghost" size="icon" onClick={() => removeAsset(asset.id)}>
+                          <Trash2 className="h-4 w-4 text-red-500" />
+                        </Button>
+                      ) : null}
                     </div>
                   </div>
 
@@ -920,7 +947,7 @@ export function Ledger({ onEditAsset, onAddAsset }: { onEditAsset?: (asset: Asse
                               {hasActionablePriceFailure(asset) ? <AlertTriangle className="h-3.5 w-3.5" /> : null}
                               {getPricingActionLabel(asset)}
                             </button>
-                            {!isGoldAsset(asset) && asset.ticker ? (
+                            {((!isGoldAsset(asset) && asset.ticker) || asset.connectedProvider === 'splitwise') ? (
                               <button
                                 type="button"
                                 onClick={() => void handleRefreshRow(asset.id)}
@@ -934,7 +961,7 @@ export function Ledger({ onEditAsset, onAddAsset }: { onEditAsset?: (asset: Asse
                             ) : null}
                           </>
                         ) : (
-                          <div>Manual pricing</div>
+                          <div>{getPricingModeLabel(asset)}</div>
                         )}
                       </div>
                     <div>
@@ -1101,7 +1128,7 @@ export function Ledger({ onEditAsset, onAddAsset }: { onEditAsset?: (asset: Asse
                         {shouldDisplayTicker(asset) && asset.ticker ? ` • ${asset.ticker}` : ''}
                       </div>
                       <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">
-                        {asset.autoUpdate ? (
+                        {isLivePricingAsset(asset) ? (
                           hasActionablePriceFailure(asset)
                             ? <span className="text-amber-600">{getVisiblePriceFetchMessage(asset, priceProviderSettings)}</span>
                             : isQueuedAsset(asset)
@@ -1197,7 +1224,7 @@ function AssetClassFilterRow({
   assetClassesMeta,
 }: {
   country: 'Canada' | 'India';
-  assetClasses: string[];
+  assetClasses: AssetClassFilterOption[];
   activeAssetClass: string;
   onSelect: (value: string) => void;
   assetClassesMeta: Array<{ country: string; name: string; image?: string }>;
@@ -1206,15 +1233,15 @@ function AssetClassFilterRow({
     <div className="grid gap-2 md:grid-cols-[80px_minmax(0,1fr)] md:items-start">
       <div className="pt-1 text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-400 dark:text-slate-500">{country}</div>
       <div className="flex flex-wrap gap-2">
-        {assetClasses.map((assetClass) => {
-          const assetClassMeta = assetClassesMeta.find((candidate) => candidate.country === country && getCanonicalAssetClass(candidate.name) === assetClass);
+        {assetClasses.map((assetClassOption) => {
+          const assetClassMeta = assetClassesMeta.find((candidate) => candidate.country === country && getCanonicalAssetClass(candidate.name) === assetClassOption.label);
           return (
             <AssetClassFilterChip
-              key={`${country}-${assetClass}`}
-              label={assetClass}
+              key={assetClassOption.value}
+              label={assetClassOption.label}
               image={assetClassMeta?.image}
-              active={activeAssetClass === assetClass}
-              onClick={() => onSelect(assetClass)}
+              active={activeAssetClass === assetClassOption.value}
+              onClick={() => onSelect(assetClassOption.value)}
             />
           );
         })}
@@ -1939,6 +1966,18 @@ function getAssetIcon(assetClass: string) {
 
 function usesTickerPricing(asset: Asset) {
   return asset.autoUpdate && !['Gold', 'Cash', 'PF/NPS/FD', 'TFSA/RRSP/FHSA', 'Real Estate', 'Other', 'Credit Card'].includes(asset.assetClass);
+}
+
+function isConnectedUpstoxCloudAsset(asset: Asset) {
+  return Boolean(asset.sourceManaged && asset.connectedProvider === 'upstox');
+}
+
+function isLivePricingAsset(asset: Asset) {
+  return asset.autoUpdate || isConnectedUpstoxCloudAsset(asset);
+}
+
+function getPricingModeLabel(asset: Asset) {
+  return isLivePricingAsset(asset) ? 'Live price enabled' : 'Manual pricing';
 }
 
 function showsTickerManagement(asset: Asset) {

@@ -28,6 +28,18 @@ export interface Asset {
   priceFetchStatus?: 'idle' | 'success' | 'failed';
   priceFetchMessage?: string;
   priceProvider?: string;
+  sourceType?: 'manual' | 'connected';
+  sourceManaged?: boolean;
+  connectedProvider?: 'upstox' | 'splitwise';
+  connectedHoldingId?: string;
+  connectedAccountId?: string;
+  holdingKind?: 'holding' | 'position';
+  positionSide?: 'long' | 'short' | 'unknown';
+  hiddenFromDashboard?: boolean;
+  possibleDuplicateOf?: string;
+  splitwiseOriginalBreakdown?: Array<{ currency: string; amount: number }>;
+  splitwiseConvertedCurrency?: 'CAD' | 'INR' | 'USD';
+  splitwiseConversionNote?: string;
 }
 
 export interface AssetClassDef {
